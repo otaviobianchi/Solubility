@@ -1,239 +1,347 @@
 # ============================================================
-#  APP.PY — PARTE 1/4 (MELHORADA)
-#  Aba 1: Upload + seleção de colunas + base padronizada
-#  Melhorias incluídas:
-#   ✅ "Numerical Optimization" (sem "Hansen") na UI
-#   ✅ Leitura robusta (vírgula decimal em solubilidade: "0,5" -> 0.5)
-#   ✅ Group NaN -> "UNK"
-#   ✅ Dedup opcional com arredondamento (evita duplicatas numéricas quase iguais)
-#   ✅ Cache de leitura do Excel (st.cache_data)
-#   ✅ Guarda metadados + mapeamentos em st.session_state para export
-#  Saídas (para Partes 2–4):
-#   - df_filtered (delta_d, delta_p, delta_h, solubility[, group])
-#   - y_raw, y, w
-#   - use_group, groups, group_col
-#   - UNIT
+# BLOCO 1/4 — CORE FUNCTIONS (REQUIRED)
+# Defines: hansen_distance, prob_from_red, red_values,
+#          objective functions, z_to_x, fit_by_methods
 # ============================================================
-
-import warnings
-warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import streamlit as st
-from datetime import datetime
+
+from scipy.optimize import minimize, differential_evolution, dual_annealing, shgo
+
+# Optional GA (pygad). If missing, GA step is skipped.
+try:
+    import pygad
+    _HAS_PYGAD = True
+except Exception:
+    _HAS_PYGAD = False
 
 # -----------------------------
-# Page config (UI sem "Hansen")
+# Bounds (δd, δp, δh, R0)
 # -----------------------------
-st.set_page_config(page_title="Numerical Optimization vs ML", layout="wide")
-st.title("🧪 Numerical Optimization vs ML (Classification)")
-st.caption("Academic/research use only — screening tool, not a standalone decision device.")
+BOUNDS = [(10, 25), (0, 25), (0, 25), (2, 25)]
 
-UNIT = "MPa\u00b9\u2044\u00b2"  # MPa¹⁄²
-APP_VERSION = "v1.0.0-numopt-ml"
+# -----------------------------
+# Numerical Optimization distance
+# -----------------------------
+def hansen_distance(d_d, d_p, d_h, dp, pp, hp):
+    return np.sqrt(4*(np.asarray(d_d) - dp)**2 + (np.asarray(d_p) - pp)**2 + (np.asarray(d_h) - hp)**2)
 
-# ============================================================
-# Caches & Helpers
-# ============================================================
-@st.cache_data(show_spinner=False)
-def _read_excel(file_bytes: bytes):
-    # Return ExcelFile-like info without holding the raw uploader object
-    bio = pd.io.common.BytesIO(file_bytes)
-    xls = pd.ExcelFile(bio)
-    return xls.sheet_names, file_bytes
+def prob_from_red(RED, k=6.0):
+    RED = np.asarray(RED, float)
+    z = k*(1.0 - RED)
+    z = np.clip(z, -60, 60)
+    p = 1.0 / (1.0 + np.exp(-z))
+    return np.clip(p, 1e-12, 1.0-1e-12)
 
-@st.cache_data(show_spinner=False)
-def _parse_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    bio = pd.io.common.BytesIO(file_bytes)
-    xls = pd.ExcelFile(bio)
-    return xls.parse(sheet_name)
+def red_values(df_local, params):
+    dp, pp, hp, R0 = map(float, params)
+    Ra = hansen_distance(
+        df_local["delta_d"].values,
+        df_local["delta_p"].values,
+        df_local["delta_h"].values,
+        dp, pp, hp
+    )
+    return Ra / max(R0, 1e-6)
 
-def _stop(msg: str):
-    st.error(msg)
-    st.stop()
+# -----------------------------
+# Objective functions
+# -----------------------------
+def df_geom(d_d, d_p, d_h, y, x, weights=None):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
 
-def _to_float_series(s: pd.Series) -> pd.Series:
-    # robust numeric parsing: accepts "0,5" and "0.5"
-    if s.dtype == object:
-        s2 = s.astype(str).str.replace(",", ".", regex=False)
-        return pd.to_numeric(s2, errors="coerce")
-    return pd.to_numeric(s, errors="coerce")
+    A = np.ones_like(Ra, dtype=float)
+    A[(Ra > R0) & (y == 1)] = np.exp(R0 - Ra[(Ra > R0) & (y == 1)])      # positives outside
+    A[(Ra <= R0) & (y == 0)] = np.exp(Ra[(Ra <= R0) & (y == 0)] - R0)    # negatives inside
 
-def _require_cols(df: pd.DataFrame, cols):
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        _stop(f"Missing columns in sheet: {missing}")
+    if weights is None:
+        gm = np.exp(np.mean(np.log(A + 1e-12)))
+    else:
+        ww = np.asarray(weights, float)
+        gm = np.exp(np.sum(ww * np.log(A + 1e-12)) / np.sum(ww))
+    return float(abs(gm - 1.0))
 
-def _build_standard_df(
-    df: pd.DataFrame,
-    delta_d_col: str,
-    delta_p_col: str,
-    delta_h_col: str,
-    solub_col: str,
-    group_col: str | None,
-    dedup_round: int | None = None
+def df_logloss(d_d, d_p, d_h, y_bin, x, weights=None, k=6.0, reg_ro=0.05, ro_ref=None):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+    RED = Ra / R0
+    p = prob_from_red(RED, k=k)
+
+    y = np.asarray(y_bin).astype(int)
+    ll = -(y*np.log(p) + (1-y)*np.log(1-p))
+
+    if weights is None:
+        loss = float(np.mean(ll))
+    else:
+        ww = np.asarray(weights, float)
+        loss = float(np.sum(ww*ll) / np.sum(ww))
+
+    if reg_ro and reg_ro > 0:
+        if ro_ref is None:
+            ro_ref = float(np.median(Ra))
+        loss = loss + float(reg_ro)*((R0 - ro_ref)/max(ro_ref, 1e-6))**2
+    return float(loss)
+
+def df_brier(d_d, d_p, d_h, y_bin, x, weights=None, k=6.0, reg_ro=0.05, ro_ref=None):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+    RED = Ra / R0
+    p = prob_from_red(RED, k=k)
+
+    y = np.asarray(y_bin).astype(float)
+    b = (p - y)**2
+
+    if weights is None:
+        loss = float(np.mean(b))
+    else:
+        ww = np.asarray(weights, float)
+        loss = float(np.sum(ww*b) / np.sum(ww))
+
+    if reg_ro and reg_ro > 0:
+        if ro_ref is None:
+            ro_ref = float(np.median(Ra))
+        loss = loss + float(reg_ro)*((R0 - ro_ref)/max(ro_ref, 1e-6))**2
+    return float(loss)
+
+def df_hinge(d_d, d_p, d_h, y_bin, x, weights=None):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+    RED = Ra / R0
+
+    y = np.asarray(y_bin).astype(int)
+    pos = (y == 1)
+    neg = (y == 0)
+    loss_pos = np.maximum(0.0, RED[pos] - 1.0)
+    loss_neg = np.maximum(0.0, 1.0 - RED[neg])
+
+    loss_vec = np.concatenate([loss_pos, loss_neg], axis=0)
+    if loss_vec.size == 0:
+        return 0.0
+
+    if weights is None:
+        return float(np.mean(loss_vec))
+
+    ww = np.asarray(weights, float)
+    ww_vec = np.concatenate([ww[pos], ww[neg]], axis=0)
+    return float(np.sum(ww_vec*loss_vec) / np.sum(ww_vec))
+
+def df_softcount(d_d, d_p, d_h, y_bin, x, weights=None, beta=8.0):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+    RED = Ra / R0
+    y = np.asarray(y_bin).astype(int)
+
+    s_out = 1.0 / (1.0 + np.exp(-beta*(RED - 1.0)))     # ~1 outside
+    err = np.where(y == 1, s_out, (1.0 - s_out))        # pos outside / neg inside
+
+    if weights is None:
+        return float(np.mean(err))
+    ww = np.asarray(weights, float)
+    return float(np.sum(ww*err) / np.sum(ww))
+
+# -----------------------------
+# Reparam for unconstrained solvers
+# -----------------------------
+def z_to_x(z, bounds=BOUNDS):
+    lo = np.array([b[0] for b in bounds], float)
+    hi = np.array([b[1] for b in bounds], float)
+    s  = 1.0 / (1.0 + np.exp(-np.asarray(z, float)))
+    return lo + s*(hi - lo)
+
+# -----------------------------
+# MAIN: fit_by_methods (called in Bloco 2 + Bloco 3 CV)
+# -----------------------------
+def fit_by_methods(
+    df_local,
+    weights_local,
+    df_name="DF_GEOM",
+    K_PROB=6.0,
+    REG_R0=0.05,
+    nms_restarts=1,
+    cobyla_restarts=1,
+    speed_profile="full"
 ):
-    use_group = group_col is not None
-    cols = [delta_d_col, delta_p_col, delta_h_col, solub_col] + ([group_col] if use_group else [])
-    _require_cols(df, cols)
+    d_d = df_local["delta_d"].values.astype(float)
+    d_p = df_local["delta_p"].values.astype(float)
+    d_h = df_local["delta_h"].values.astype(float)
+    yloc = df_local["solubility"].values.astype(int)
 
-    out = df[cols].copy()
-    out.columns = ["delta_d", "delta_p", "delta_h", "solubility"] + (["group"] if use_group else [])
+    Ra_ref = hansen_distance(d_d, d_p, d_h, np.median(d_d), np.median(d_p), np.median(d_h))
+    ro_ref = float(np.median(Ra_ref))
 
-    # numeric coercion
-    out["delta_d"] = _to_float_series(out["delta_d"])
-    out["delta_p"] = _to_float_series(out["delta_p"])
-    out["delta_h"] = _to_float_series(out["delta_h"])
-    out["solubility"] = _to_float_series(out["solubility"])
-
-    # groups
-    if use_group:
-        out["group"] = out["group"].astype(str)
-        out.loc[out["group"].isin(["nan", "None", "NaN"]), "group"] = "UNK"
-        out["group"] = out["group"].fillna("UNK")
-
-    # keep only valid rows
-    out = out.dropna(subset=["delta_d", "delta_p", "delta_h", "solubility"]).reset_index(drop=True)
-
-    # optional rounding before dedup to avoid "almost duplicates"
-    if dedup_round is not None and int(dedup_round) >= 0:
-        r = int(dedup_round)
-        out["delta_d_r"] = out["delta_d"].round(r)
-        out["delta_p_r"] = out["delta_p"].round(r)
-        out["delta_h_r"] = out["delta_h"].round(r)
-        out["solubility_r"] = out["solubility"].round(r)
-        dedup_cols = ["delta_d_r", "delta_p_r", "delta_h_r", "solubility_r"] + (["group"] if use_group else [])
-        out = out.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
-        out = out.drop(columns=["delta_d_r","delta_p_r","delta_h_r","solubility_r"])
+    # choose objective
+    if df_name == "DF_GEOM":
+        def DF(x): return df_geom(d_d, d_p, d_h, yloc, x, weights=weights_local)
+    elif df_name == "DF_LOGLOSS":
+        def DF(x): return df_logloss(d_d, d_p, d_h, yloc, x, weights=weights_local, k=K_PROB, reg_ro=REG_R0, ro_ref=ro_ref)
+    elif df_name == "DF_BRIER":
+        def DF(x): return df_brier(d_d, d_p, d_h, yloc, x, weights=weights_local, k=K_PROB, reg_ro=REG_R0, ro_ref=ro_ref)
+    elif df_name == "DF_HINGE":
+        def DF(x): return df_hinge(d_d, d_p, d_h, yloc, x, weights=weights_local)
+    elif df_name == "DF_SOFTCOUNT":
+        def DF(x): return df_softcount(d_d, d_p, d_h, yloc, x, weights=weights_local, beta=8.0)
     else:
-        dedup_cols = ["delta_d", "delta_p", "delta_h", "solubility"] + (["group"] if use_group else [])
-        out = out.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
+        raise ValueError("Unknown DF name.")
 
-    return out, use_group
-
-# ============================================================
-# Tabs skeleton (Partes 2–4 preenchem as abas restantes)
-# ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "1) Upload & Columns",
-    "2) Numerical Optimization",
-    "3) ML (Calibrated)",
-    "4) Cross-Validation (LOGO/LOO)",
-    "5) 3D Spheres (Plotly)",
-    "6) Export (Excel)"
-])
-
-# ============================================================
-# TAB 1 — Upload & mapping
-# ============================================================
-with tab1:
-    st.subheader("Upload + Column Mapping")
-
-    uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-    if uploaded is None:
-        st.info("Upload an .xlsx file to start.")
-        st.stop()
-
-    file_bytes = uploaded.getvalue()
-    try:
-        sheet_names, file_bytes = _read_excel(file_bytes)
-    except Exception as e:
-        _stop(f"Could not read Excel: {e}")
-
-    sheet = st.selectbox("Choose sheet", sheet_names, index=0)
-
-    try:
-        df_raw = _parse_sheet(file_bytes, sheet)
-    except Exception as e:
-        _stop(f"Could not parse sheet '{sheet}': {e}")
-
-    if df_raw is None or df_raw.empty:
-        _stop("Selected sheet is empty.")
-
-    st.write("Preview (first rows):")
-    st.dataframe(df_raw.head(30), use_container_width=True)
-
-    cols = list(df_raw.columns)
-    if len(cols) < 4:
-        _stop("Need at least 4 columns (δd, δp, δh, solubility).")
-
-    st.markdown("### Map columns")
-    c1, c2, c3, c4 = st.columns([1.0, 1.0, 1.0, 1.2])
-
-    with c1:
-        delta_d_col = st.selectbox("δd column", cols, index=0)
-        delta_p_col = st.selectbox("δp column", cols, index=min(1, len(cols)-1))
-    with c2:
-        delta_h_col = st.selectbox("δh column", cols, index=min(2, len(cols)-1))
-        solub_col   = st.selectbox("Solubility column (0 / 0.5 / 1)", cols, index=min(3, len(cols)-1))
-    with c3:
-        group_opt = st.selectbox("Group column for LOGO (optional)", ["(none)"] + cols, index=0)
-        group_col = None if group_opt == "(none)" else group_opt
-    with c4:
-        dedup_mode = st.checkbox("Deduplicate with rounding", value=True)
-        dedup_round = st.number_input("Rounding decimals (dedup)", min_value=0, max_value=6, value=3, step=1, disabled=not dedup_mode)
-
-    df_filtered, use_group = _build_standard_df(
-        df_raw,
-        delta_d_col=delta_d_col,
-        delta_p_col=delta_p_col,
-        delta_h_col=delta_h_col,
-        solub_col=solub_col,
-        group_col=group_col,
-        dedup_round=(int(dedup_round) if dedup_mode else None)
-    )
-
-    # Label: PARTIAL -> binary + weights
-    y_raw = df_filtered["solubility"].astype(float).values
-    y = (y_raw >= 0.5).astype(int)                 # 0.5 -> 1
-    w = np.where(y_raw == 0.5, 0.5, 1.0).astype(float)
-    df_filtered["solubility"] = y
-
-    # Groups
-    if use_group:
-        groups = df_filtered["group"].astype(str).values
-        n_groups = len(np.unique(groups))
-        st.success(f"CV scheme: LOGO | group column = '{group_col}' | #groups = {n_groups}")
+    # speed presets
+    if str(speed_profile).lower() == "fast":
+        maxiter_local = 900
+        maxiter_de = 220
+        maxiter_da = 220
+        shgo_n = 64
+        shgo_iters = 2
+        ga_gen = 80
+        ga_pop = 28
+        do_global = True
     else:
-        groups = None
-        st.success("CV scheme: LOO (no group column provided)")
+        maxiter_local = 2000
+        maxiter_de = 700
+        maxiter_da = 500
+        shgo_n = 128
+        shgo_iters = 3
+        ga_gen = 180
+        ga_pop = 40
+        do_global = True
 
-    # Summary
-    n_total = len(df_filtered)
-    n_pos = int(np.sum(y))
-    n_neg = int(n_total - n_pos)
-    n_partial = int(np.sum(y_raw == 0.5))
+    starts = [
+        ("start=median", [np.median(d_d), np.median(d_p), np.median(d_h), 10.0]),
+        ("start=mean",   [np.mean(d_d),   np.mean(d_p),   np.mean(d_h),   12.0]),
+    ]
 
-    st.markdown("### Dataset summary")
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Samples", n_total)
-    s2.metric("Positives (bin)", n_pos)
-    s3.metric("Negatives", n_neg)
-    s4.metric("Partial (0.5)", n_partial)
+    rows = []
 
-    st.markdown("### Standardized table (used by all tabs)")
-    show_cols = ["delta_d", "delta_p", "delta_h", "solubility"] + (["group"] if use_group else [])
-    st.dataframe(df_filtered[show_cols].head(80), use_container_width=True)
+    def _append_row(metodo, execucao, pars):
+        pars = np.asarray(pars, float)
+        pars[3] = max(float(pars[3]), 1e-6)
 
-    # ---- Save metadata + mapping for later tabs/export ----
-    st.session_state["app_version"] = APP_VERSION
-    st.session_state["run_timestamp"] = datetime.utcnow().isoformat() + "Z"
-    st.session_state["sheet_name"] = sheet
-    st.session_state["colmap"] = dict(
-        delta_d_col=delta_d_col,
-        delta_p_col=delta_p_col,
-        delta_h_col=delta_h_col,
-        solub_col=solub_col,
-        group_col=(group_col if use_group else None),
-        dedup_mode=bool(dedup_mode),
-        dedup_round=(int(dedup_round) if dedup_mode else None),
-    )
-    st.session_state["group_col"] = (group_col if use_group else "None")
+        RED = red_values(df_local, pars)
+        p = prob_from_red(RED, k=K_PROB)
 
-    st.info("Tab 1 ready. Now run Tab 2 (Numerical Optimization).")
+        # unweighted AUC/AP (paper reporting)
+        aucv = roc_auc_score(yloc, p) if len(np.unique(yloc)) == 2 else np.nan
+        aupr = average_precision_score(yloc, p) if len(np.unique(yloc)) == 2 else np.nan
 
-# Fim da PARTE 1/4 (melhorada)
+        rows.append(dict(
+            DF=df_name,
+            Método=str(metodo),
+            Execucao=str(execucao),
+            delta_d=float(pars[0]),
+            delta_p=float(pars[1]),
+            delta_h=float(pars[2]),
+            R0=float(pars[3]),
+            DF_GEOM=float(df_geom(d_d, d_p, d_h, yloc, pars, weights=weights_local)),
+            DF_LOGLOSS=float(df_logloss(d_d, d_p, d_h, yloc, pars, weights=weights_local, k=K_PROB, reg_ro=REG_R0, ro_ref=ro_ref)),
+            DF_MAIN=float(DF(pars)),
+            AUC_unweighted=float(aucv) if aucv == aucv else np.nan,
+            AUPRC_unweighted=float(aupr) if aupr == aupr else np.nan,
+        ))
+
+    # Local solvers
+    for met in ["Powell", "L-BFGS-B", "TNC"]:
+        for tag, guess in starts:
+            try:
+                res = minimize(
+                    DF, guess, method=met,
+                    bounds=BOUNDS if met in ["L-BFGS-B", "TNC"] else None,
+                    options=dict(maxiter=maxiter_local)
+                )
+                _append_row(met, tag, res.x)
+            except Exception:
+                pass
+
+    if do_global:
+        # Differential Evolution
+        try:
+            res_de = differential_evolution(DF, BOUNDS, maxiter=maxiter_de, polish=True, seed=42)
+            _append_row("Differential Evolution", "global", res_de.x)
+        except Exception:
+            pass
+
+        # Dual Annealing
+        try:
+            res_da = dual_annealing(DF, bounds=np.array(BOUNDS, float), maxiter=maxiter_da)
+            _append_row("Dual Annealing", "global", res_da.x)
+        except Exception:
+            pass
+
+        # SHGO
+        try:
+            res_sh = shgo(DF, BOUNDS, n=shgo_n, iters=shgo_iters)
+            _append_row("SHGO", "global", res_sh.x)
+        except Exception:
+            pass
+
+        # GA (optional)
+        if _HAS_PYGAD:
+            def fitness_func(ga_instance, solution, solution_idx):
+                return float(-DF(solution))
+            try:
+                ga = pygad.GA(
+                    num_generations=int(ga_gen),
+                    num_parents_mating=12,
+                    fitness_func=fitness_func,
+                    sol_per_pop=int(ga_pop),
+                    num_genes=4,
+                    mutation_probability=0.15,
+                    crossover_probability=0.9,
+                    parent_selection_type="sss",
+                    keep_parents=2,
+                    stop_criteria=["saturate_50"],
+                    gene_space=[{"low": b[0], "high": b[1]} for b in BOUNDS],
+                    random_seed=42
+                )
+                ga.run()
+                _append_row("Genetic Algorithm", "global", ga.best_solution()[0])
+            except Exception:
+                pass
+
+    # Nelder–Mead (reparam)
+    try:
+        for r in range(int(nms_restarts)):
+            z0 = np.zeros(4) if r == 0 else np.random.normal(0.0, 0.7, 4)
+            tag = "z0=center" if r == 0 else f"z0=rand#{r}"
+            def DF_unconstrained(z):
+                return DF(z_to_x(z, BOUNDS))
+            res_nm = minimize(
+                DF_unconstrained, z0, method="Nelder-Mead",
+                options=dict(maxiter=3000, maxfev=6000, xatol=1e-6, fatol=1e-9)
+            )
+            _append_row("Nelder-Mead (reparam)", tag, z_to_x(res_nm.x, BOUNDS))
+    except Exception:
+        pass
+
+    # COBYLA (reparam)
+    try:
+        for r in range(int(cobyla_restarts)):
+            z0 = np.zeros(4) if r == 0 else np.random.normal(0.0, 0.7, 4)
+            tag = "z0=center" if r == 0 else f"z0=rand#{r}"
+            def DF_unconstrained(z):
+                return DF(z_to_x(z, BOUNDS))
+            res_c = minimize(
+                DF_unconstrained, z0, method="COBYLA",
+                options=dict(maxiter=2500, rhobeg=1.0, catol=1e-8)
+            )
+            _append_row("COBYLA (reparam)", tag, z_to_x(res_c.x, BOUNDS))
+    except Exception:
+        pass
+
+    df_params = pd.DataFrame(rows)
+    if df_params.empty:
+        return df_params
+
+    df_params = df_params.sort_values(
+        by=["DF_MAIN", "DF_LOGLOSS", "DF_GEOM", "AUPRC_unweighted", "AUC_unweighted"],
+        ascending=[True, True, True, False, False]
+    ).reset_index(drop=True)
+
+    return df_params
+
 # ============================================================
 #  BLOCO 2 (PARTE 2/4) — COMPLETO (Numerical Optimization)
 #  - Destaque (cards) com δd, δp, δh, R0 + DF/Optimizer no TOPO
