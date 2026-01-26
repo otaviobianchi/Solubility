@@ -343,17 +343,20 @@ def fit_by_methods(
     return df_params
 
 # ============================================================
-#  BLOCO 2 (PARTE 2/4) — COMPLETO (Numerical Optimization)
+#  BLOCO 2/4 — COMPLETO (Numerical Optimization) — FIX UNIT DEFAULT
 #  - Destaque (cards) com δd, δp, δh, R0 + DF/Optimizer no TOPO
 #  - Wrapper robusto para fit_by_methods (evita crash por assinatura diferente)
 #  - Confusion matrix (in-sample) + métricas rápidas
 #  - Mapa 2D colocado MAIS ABAIXO (como você pediu)
 #
-#  REQUISITOS (Bloco 1):
-#   - df_filtered (colunas: delta_d, delta_p, delta_h, solubility)
-#   - y_raw, w, use_group, groups, UNIT
+#  FIX IMPORTANTE:
+#   - NÃO usa UNIT como default em assinatura de função (evita NameError)
+#   - unit é resolvido via st.session_state.get("UNIT", "MPa½")
+#
+#  REQUISITOS (BLOCO 1/4):
+#   - df_filtered (delta_d, delta_p, delta_h, solubility)
+#   - y_raw, w, use_group, groups
 #   - funções: hansen_distance, red_values, prob_from_red, fit_by_methods
-#   - opcional: st.session_state["NMS_RESTARTS"], ["COBYLA_RESTARTS"]
 # ============================================================
 
 import numpy as np
@@ -388,9 +391,16 @@ def plot_confusion_matrix_pretty(cm, title="Confusion Matrix", xlabel="Predicted
     return fig
 
 # -----------------------------
-# 2D map (δd, δp) with δh fixed at center
+# 2D map (δd, δp) with δh fixed at center  — NO UNIT DEFAULT
 # -----------------------------
-def plot_numopt_map(df_local, center, R0, unit=UNIT, bins=36, pad=1.0, k_prob=6.0):
+def plot_numopt_map(df_local, center, R0, unit=None, bins=36, pad=1.0, k_prob=6.0):
+    """
+    2D map in (δd, δp) plane with δh fixed at optimized center.
+    Colors represent p(RED) = sigmoid(k*(1-RED)).
+    """
+    if unit is None:
+        unit = st.session_state.get("UNIT", "MPa\u00b9\u2044\u00b2")  # MPa½
+
     dp, pp, hp = map(float, center)
 
     dmin = float(df_local["delta_d"].min() - pad)
@@ -410,7 +420,10 @@ def plot_numopt_map(df_local, center, R0, unit=UNIT, bins=36, pad=1.0, k_prob=6.
     fig = plt.figure(figsize=(7.2, 5.6), dpi=160)
     im = plt.imshow(P, origin="lower", extent=[dmin, dmax, pmin, pmax], aspect="auto")
     plt.colorbar(im, label="p(RED)")
-    plt.scatter(df_local["delta_d"], df_local["delta_p"], s=18, alpha=0.85, edgecolors="k", linewidths=0.3)
+    plt.scatter(
+        df_local["delta_d"], df_local["delta_p"],
+        s=18, alpha=0.85, edgecolors="k", linewidths=0.3
+    )
 
     plt.axvline(dp, linestyle="--", linewidth=1.0, alpha=0.6)
     plt.axhline(pp, linestyle="--", linewidth=1.0, alpha=0.6)
@@ -427,7 +440,7 @@ def plot_numopt_map(df_local, center, R0, unit=UNIT, bins=36, pad=1.0, k_prob=6.
 # -----------------------------
 def _call_fit_by_methods(df_local, weights_local, df_name, nms_restarts=1, cobyla_restarts=1):
     """
-    Tries the "new" signature (with K_PROB/REG_R0/speed_profile),
+    Tries "new" signature (with K_PROB/REG_R0/speed_profile),
     then falls back to the original signature.
     """
     try:
@@ -455,6 +468,11 @@ def _call_fit_by_methods(df_local, weights_local, df_name, nms_restarts=1, cobyl
 # ============================================================
 with tab2:
     st.subheader("Numerical Optimization — Sphere Fit (Solubility Parameters)")
+
+    # Guarantee UNIT available for labels (not required, but convenient)
+    if "UNIT" not in st.session_state:
+        st.session_state["UNIT"] = "MPa\u00b9\u2044\u00b2"
+    UNIT_LOCAL = st.session_state["UNIT"]
 
     # Controls
     c1, c2, c3 = st.columns([1.1, 1.1, 1.1])
@@ -532,7 +550,7 @@ with tab2:
                         best_overall = row0
 
             if best_overall is None:
-                st.error("No Numerical Optimization results. Check your data/columns and Bloco 1 functions.")
+                st.error("No Numerical Optimization results. Check your data/columns and BLOCO 1 functions.")
                 st.stop()
 
             df_all_runs = pd.concat(all_runs, ignore_index=True) if len(all_runs) else pd.DataFrame()
@@ -553,10 +571,10 @@ with tab2:
     # ✅ HIGHLIGHT at top
     st.markdown("### ⭐ Solubility Parameters — Optimized by Numerical Optimization")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("δd (center)", f"{dp:.4f} {UNIT}")
-    m2.metric("δp (center)", f"{pp:.4f} {UNIT}")
-    m3.metric("δh (center)", f"{hp:.4f} {UNIT}")
-    m4.metric("R0 (radius)", f"{R0:.4f} {UNIT}")
+    m1.metric("δd (center)", f"{dp:.4f} {UNIT_LOCAL}")
+    m2.metric("δp (center)", f"{pp:.4f} {UNIT_LOCAL}")
+    m3.metric("δh (center)", f"{hp:.4f} {UNIT_LOCAL}")
+    m4.metric("R0 (radius)", f"{R0:.4f} {UNIT_LOCAL}")
 
     mm1, mm2, mm3 = st.columns([1.4, 1.2, 1.4])
     mm1.metric("Best DF", best_df_name)
@@ -630,7 +648,7 @@ with tab2:
             df_filtered,
             center=(dp, pp, hp),
             R0=R0,
-            unit=UNIT,
+            unit=UNIT_LOCAL,
             bins=int(map_bins),
             pad=1.0,
             k_prob=float(K_PROB)
