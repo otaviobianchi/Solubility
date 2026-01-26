@@ -235,16 +235,17 @@ with tab1:
 
 # Fim da PARTE 1/4 (melhorada)
 # ============================================================
-#  APP.PY — PARTE 2/4 (COM DESTAQUES + MAPA MAIS ABAIXO)
-#  Aba 2: Numerical Optimization (sphere fit) + métricas/figuras
+#  BLOCO 2 (PARTE 2/4) — COMPLETO (Numerical Optimization)
+#  - Destaque (cards) com δd, δp, δh, R0 + DF/Optimizer no TOPO
+#  - Wrapper robusto para fit_by_methods (evita crash por assinatura diferente)
+#  - Confusion matrix (in-sample) + métricas rápidas
+#  - Mapa 2D colocado MAIS ABAIXO (como você pediu)
 #
-#  ✅ Melhorias:
-#   - Destaque (cards) com δd, δp, δh, R0 + DF/Optimizer no TOPO da aba
-#   - Mapa (heatmap/2D map) fica MAIS ABAIXO (após os resultados principais)
-#   - Guarda states para export (dp,pp,hp,R0, thr, RED_all, p_numopt_in, df_all_runs)
-#
-#  Requisitos (Parte 1/4): df_filtered, y_raw, w, use_group, groups, UNIT,
-#  + funções: hansen_distance, red_values, prob_from_red, fit_by_methods, etc.
+#  REQUISITOS (Bloco 1):
+#   - df_filtered (colunas: delta_d, delta_p, delta_h, solubility)
+#   - y_raw, w, use_group, groups, UNIT
+#   - funções: hansen_distance, red_values, prob_from_red, fit_by_methods
+#   - opcional: st.session_state["NMS_RESTARTS"], ["COBYLA_RESTARTS"]
 # ============================================================
 
 import numpy as np
@@ -254,14 +255,17 @@ import matplotlib.pyplot as plt
 
 from sklearn.metrics import roc_curve, roc_auc_score, average_precision_score, confusion_matrix
 
-# ------------------------------------------------------------
-# Pretty confusion matrix (matplotlib -> streamlit)
-# ------------------------------------------------------------
+# -----------------------------
+# Pretty axes
+# -----------------------------
 def _article_axes(ax):
     ax.grid(True, alpha=0.25)
     for spine in ax.spines.values():
         spine.set_alpha(0.6)
 
+# -----------------------------
+# Confusion matrix
+# -----------------------------
 def plot_confusion_matrix_pretty(cm, title="Confusion Matrix", xlabel="Predicted", ylabel="True"):
     fig = plt.figure(figsize=(5.6, 4.8), dpi=160)
     plt.imshow(cm, interpolation="nearest")
@@ -275,15 +279,12 @@ def plot_confusion_matrix_pretty(cm, title="Confusion Matrix", xlabel="Predicted
     plt.tight_layout()
     return fig
 
-# ------------------------------------------------------------
-# 2D "map" helper (keep simple and put below)
-# ------------------------------------------------------------
-def plot_numopt_map(df_local, center, R0, unit=UNIT, bins=36, pad=1.0):
-    """
-    Simple 2D map in (δd, δp) plane using δh fixed at center δh.
-    Colors show p(RED) = sigmoid(k*(1-RED)).
-    """
+# -----------------------------
+# 2D map (δd, δp) with δh fixed at center
+# -----------------------------
+def plot_numopt_map(df_local, center, R0, unit=UNIT, bins=36, pad=1.0, k_prob=6.0):
     dp, pp, hp = map(float, center)
+
     dmin = float(df_local["delta_d"].min() - pad)
     dmax = float(df_local["delta_d"].max() + pad)
     pmin = float(df_local["delta_p"].min() - pad)
@@ -294,18 +295,12 @@ def plot_numopt_map(df_local, center, R0, unit=UNIT, bins=36, pad=1.0):
     DD, PP = np.meshgrid(xd, xp, indexing="xy")
     HH = np.full_like(DD, hp)
 
-    # RED on grid
     Ra = hansen_distance(DD, PP, HH, dp, pp, hp)
     RED = Ra / max(float(R0), 1e-6)
-    P = prob_from_red(RED, k=float(st.session_state.get("K_PROB", 6.0)))
+    P = prob_from_red(RED, k=float(k_prob))
 
     fig = plt.figure(figsize=(7.2, 5.6), dpi=160)
-    im = plt.imshow(
-        P,
-        origin="lower",
-        extent=[dmin, dmax, pmin, pmax],
-        aspect="auto"
-    )
+    im = plt.imshow(P, origin="lower", extent=[dmin, dmax, pmin, pmax], aspect="auto")
     plt.colorbar(im, label="p(RED)")
     plt.scatter(df_local["delta_d"], df_local["delta_p"], s=18, alpha=0.85, edgecolors="k", linewidths=0.3)
 
@@ -319,22 +314,58 @@ def plot_numopt_map(df_local, center, R0, unit=UNIT, bins=36, pad=1.0):
     plt.tight_layout()
     return fig
 
+# -----------------------------
+# Robust call to fit_by_methods (handles different signatures)
+# -----------------------------
+def _call_fit_by_methods(df_local, weights_local, df_name, nms_restarts=1, cobyla_restarts=1):
+    """
+    Tries the "new" signature (with K_PROB/REG_R0/speed_profile),
+    then falls back to the original signature.
+    """
+    try:
+        return fit_by_methods(
+            df_local=df_local,
+            weights_local=weights_local,
+            df_name=df_name,
+            K_PROB=float(st.session_state.get("K_PROB", 6.0)),
+            REG_R0=float(st.session_state.get("REG_R0", 0.05)),
+            nms_restarts=int(nms_restarts),
+            cobyla_restarts=int(cobyla_restarts),
+            speed_profile=st.session_state.get("speed_profile", "full")
+        )
+    except TypeError:
+        return fit_by_methods(
+            df_local=df_local,
+            weights_local=weights_local,
+            df_name=df_name,
+            nms_restarts=int(nms_restarts),
+            cobyla_restarts=int(cobyla_restarts)
+        )
+
 # ============================================================
 # TAB 2 — Numerical Optimization
 # ============================================================
 with tab2:
     st.subheader("Numerical Optimization — Sphere Fit (Solubility Parameters)")
 
-    # -----------------------------
     # Controls
-    # -----------------------------
     c1, c2, c3 = st.columns([1.1, 1.1, 1.1])
     with c1:
         RUN_NUMOPT = st.checkbox("Run Numerical Optimization", value=True)
         RUN_CM = st.checkbox("Confusion matrix (in-sample)", value=True)
     with c2:
-        K_PROB = st.number_input("K_PROB (RED→p steepness)", min_value=1.0, max_value=20.0, value=float(st.session_state.get("K_PROB", 6.0)), step=0.5)
-        REG_R0 = st.number_input("REG_R0 (radius regularization)", min_value=0.0, max_value=1.0, value=float(st.session_state.get("REG_R0", 0.05)), step=0.01)
+        K_PROB = st.number_input(
+            "K_PROB (RED→p steepness)",
+            min_value=1.0, max_value=20.0,
+            value=float(st.session_state.get("K_PROB", 6.0)),
+            step=0.5
+        )
+        REG_R0 = st.number_input(
+            "REG_R0 (radius regularization)",
+            min_value=0.0, max_value=1.0,
+            value=float(st.session_state.get("REG_R0", 0.05)),
+            step=0.01
+        )
     with c3:
         show_map = st.checkbox("Show 2D map (placed below)", value=True)
         map_bins = st.slider("Map resolution (bins)", min_value=20, max_value=80, value=36, step=2)
@@ -345,49 +376,65 @@ with tab2:
     if not RUN_NUMOPT:
         st.stop()
 
-    # -----------------------------
-    # Run DF comparison + choose global best
-    # -----------------------------
+    # Prepare data
     y = df_filtered["solubility"].values.astype(int)
     w_local = np.asarray(w, float)
 
-    DF_LIST_TO_COMPARE = ["DF_GEOM","DF_LOGLOSS","DF_BRIER","DF_HINGE","DF_SOFTCOUNT"]
+    # Objective list (>=5)
+    DF_LIST_TO_COMPARE = ["DF_GEOM", "DF_LOGLOSS", "DF_BRIER", "DF_HINGE", "DF_SOFTCOUNT"]
 
-    with st.spinner("Running Numerical Optimization (comparing objective functions and solvers)..."):
-        all_runs = []
-        best_overall = None
+    NMS_RESTARTS = int(st.session_state.get("NMS_RESTARTS", 1))
+    COBYLA_RESTARTS = int(st.session_state.get("COBYLA_RESTARTS", 1))
 
-        for df_name in DF_LIST_TO_COMPARE:
-            runs = fit_by_methods(
-                df_local=df_filtered,
-                weights_local=w_local,
-                df_name=df_name,
-                K_PROB=float(K_PROB),
-                REG_R0=float(REG_R0),
-                nms_restarts=int(st.session_state.get("NMS_RESTARTS", 1)),
-                cobyla_restarts=int(st.session_state.get("COBYLA_RESTARTS", 1)),
-                speed_profile=st.session_state.get("speed_profile", "full")  # safe: if your fit_by_methods supports it
-            )
-            if runs is None or runs.empty:
-                continue
+    # Run optimization across DFs
+    try:
+        with st.spinner("Running Numerical Optimization (comparing objective functions and solvers)..."):
+            all_runs = []
+            best_overall = None
 
-            all_runs.append(runs)
-            row0 = runs.iloc[0].to_dict()
+            for df_name in DF_LIST_TO_COMPARE:
+                runs = _call_fit_by_methods(
+                    df_local=df_filtered,
+                    weights_local=w_local,
+                    df_name=df_name,
+                    nms_restarts=NMS_RESTARTS,
+                    cobyla_restarts=COBYLA_RESTARTS
+                )
+                if runs is None or runs.empty:
+                    continue
+
+                all_runs.append(runs)
+                row0 = runs.iloc[0].to_dict()
+
+                if best_overall is None:
+                    best_overall = row0
+                else:
+                    # Paper criterion: prioritize DF_LOGLOSS + DF_GEOM + AUPRC
+                    key_new = (
+                        float(row0.get("DF_LOGLOSS", np.inf)),
+                        float(row0.get("DF_GEOM", np.inf)),
+                        -float(row0.get("AUPRC_unweighted", -np.inf))
+                    )
+                    key_old = (
+                        float(best_overall.get("DF_LOGLOSS", np.inf)),
+                        float(best_overall.get("DF_GEOM", np.inf)),
+                        -float(best_overall.get("AUPRC_unweighted", -np.inf))
+                    )
+                    if key_new < key_old:
+                        best_overall = row0
 
             if best_overall is None:
-                best_overall = row0
-            else:
-                # Paper criterion: prioritize DF_LOGLOSS + DF_GEOM + AUPRC
-                if (row0.get("DF_LOGLOSS", np.inf), row0.get("DF_GEOM", np.inf), -row0.get("AUPRC_unweighted", -np.inf)) < \
-                   (best_overall.get("DF_LOGLOSS", np.inf), best_overall.get("DF_GEOM", np.inf), -best_overall.get("AUPRC_unweighted", -np.inf)):
-                    best_overall = row0
+                st.error("No Numerical Optimization results. Check your data/columns and Bloco 1 functions.")
+                st.stop()
 
-        if best_overall is None:
-            st.error("No Numerical Optimization results. Check your data/columns.")
-            st.stop()
+            df_all_runs = pd.concat(all_runs, ignore_index=True) if len(all_runs) else pd.DataFrame()
 
-        df_all_runs = pd.concat(all_runs, ignore_index=True) if len(all_runs) else pd.DataFrame()
+    except Exception as e:
+        st.error("Numerical Optimization failed inside fit_by_methods().")
+        st.exception(e)
+        st.stop()
 
+    # Best solution
     best_df_name = str(best_overall["DF"])
     best_optimizer = str(best_overall["Método"])
     dp = float(best_overall["delta_d"])
@@ -395,9 +442,7 @@ with tab2:
     hp = float(best_overall["delta_h"])
     R0 = float(best_overall["R0"])
 
-    # -----------------------------
-    # ✅ HIGHLIGHT — show optimized parameters FIRST (top of Tab)
-    # -----------------------------
+    # ✅ HIGHLIGHT at top
     st.markdown("### ⭐ Solubility Parameters — Optimized by Numerical Optimization")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("δd (center)", f"{dp:.4f} {UNIT}")
@@ -410,9 +455,9 @@ with tab2:
     mm2.metric("Optimizer", best_optimizer)
     mm3.metric("CV scheme", "LOGO" if use_group else "LOO")
 
-    st.caption("These parameters define the optimized solubility sphere obtained by Numerical Optimization (probabilized via RED→p).")
+    st.caption("Optimized solubility parameters obtained by Numerical Optimization (sphere fit, probabilized via RED→p).")
 
-    # Save states for next tabs + export
+    # Save session state for next tabs + export
     st.session_state["numopt_done"] = True
     st.session_state["best_df_name"] = best_df_name
     st.session_state["best_optimizer"] = best_optimizer
@@ -422,9 +467,7 @@ with tab2:
     st.session_state["R0"] = R0
     st.session_state["df_all_runs"] = df_all_runs
 
-    # -----------------------------
-    # In-sample probabilities + threshold (Youden J)
-    # -----------------------------
+    # In-sample probabilities
     RED_all = red_values(df_filtered, (dp, pp, hp, R0))
     p_numopt_in = prob_from_red(RED_all, k=float(K_PROB))
 
@@ -441,9 +484,7 @@ with tab2:
     st.session_state["p_numopt_in"] = np.asarray(p_numopt_in, float)
     st.session_state["thr_numopt_in"] = float(thr_numopt_in)
 
-    # -----------------------------
-    # Outputs: quick summary + confusion matrix
-    # -----------------------------
+    # Quick in-sample summary
     cA, cB, cC = st.columns([1.2, 1.0, 1.0])
     with cA:
         st.markdown("#### In-sample summary (Numerical Optimization)")
@@ -458,6 +499,7 @@ with tab2:
         st.metric("Partial (0.5)", f"{int(np.sum(np.asarray(y_raw, float)==0.5))}")
         st.metric("N total", f"{int(len(y))}")
 
+    # Confusion matrix plot
     if RUN_CM:
         fig_cm = plot_confusion_matrix_pretty(
             cm_numopt_in,
@@ -467,20 +509,24 @@ with tab2:
         )
         st.pyplot(fig_cm, clear_figure=True)
 
-    # -----------------------------
-    # Show the full run table (optional)
-    # -----------------------------
+    # All runs table
     with st.expander("Numerical Optimization — all runs (ranked)"):
         st.dataframe(df_all_runs, use_container_width=True)
 
-    # ============================================================
-    # ✅ MAPA MAIS ABAIXO (como você pediu)
-    # ============================================================
+    # ✅ MAPA MAIS ABAIXO
     if show_map:
         st.markdown("---")
         st.markdown("## 2D Map (placed below) — Numerical Optimization")
         st.caption("Map in (δd, δp) with δh fixed at the optimized center. Colors represent p(RED).")
-        fig_map = plot_numopt_map(df_filtered, center=(dp, pp, hp), R0=R0, unit=UNIT, bins=int(map_bins), pad=1.0)
+        fig_map = plot_numopt_map(
+            df_filtered,
+            center=(dp, pp, hp),
+            R0=R0,
+            unit=UNIT,
+            bins=int(map_bins),
+            pad=1.0,
+            k_prob=float(K_PROB)
+        )
         st.pyplot(fig_map, clear_figure=True)
 
 # ============================================================
