@@ -1,108 +1,251 @@
-import io
-import zipfile
-import warnings
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List
+============================================================
+#  Numerical Optimization (Hansen) vs ML (Classification) — FINAL (PAPER)
+#  IMPLEMENTS IMPROVEMENTS 1, 2 and 3:
+#   (1) Group-wise CV (LOGO / Leave-One-Group-Out) when a group column exists;
+#       automatic fallback to LOO when not.
+#   (2) Probability calibration (CalibratedClassifierCV) with sample_weight (when supported),
+#       isotonic if N is sufficient, otherwise sigmoid.
+#   (3) ML "sphere-like" fitted on the SHELL (p≈iso): uses points with iso <= p <= iso+Δ (shell),
+#       with automatic relaxation if too few points.
+#
+#  Outputs:
+#   - Full metric tables (IN and CV; weighted/unweighted)
+#   - ROC curves (IN and CV) + PR curves (IN and CV) + calibration curves
+#   - Plotly 3D (units): Numerical Optimization sphere (RED=1) + ML shell-sphere (p≈iso) + overlay
+#   - Excel export (full)
+#  Colab-ready
+# ============================================================
 
+# -----------------------------
+# Install packages on Colab (if needed)
+# -----------------------------
+try:
+    import plotly, openpyxl, xgboost, pygad
+except ModuleNotFoundError:
+    !pip install -q plotly openpyxl xgboost pygad
+
+# Optional:
+# !pip install -q lightgbm catboost shap
+
+# -----------------------------
+# Imports
+# -----------------------------
+import warnings, time
 import numpy as np
 import pandas as pd
-import streamlit as st
+import matplotlib.pyplot as plt
 
-from scipy.optimize import minimize, differential_evolution
-from sklearn.model_selection import LeaveOneOut, LeaveOneGroupOut
-from sklearn.calibration import CalibratedClassifierCV
+from scipy.optimize import minimize, differential_evolution, dual_annealing, shgo
+
 from sklearn.metrics import (
-    roc_curve, roc_auc_score, average_precision_score, confusion_matrix
+    roc_curve, auc, roc_auc_score, average_precision_score,
+    confusion_matrix, precision_recall_curve
 )
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.model_selection import LeaveOneOut, LeaveOneGroupOut
 from xgboost import XGBClassifier
 
 import plotly.graph_objects as go
+import plotly.io as pio
+from google.colab import files
 
-
-# =========================
-# PAGE
-# =========================
-st.set_page_config(
-    page_title="Numerical Optimization vs ML — Solubility Space",
-    layout="wide"
-)
-
-st.title("Numerical Optimization vs Machine Learning in Solubility Space")
-st.markdown("""
-⚠️ **Research use only.**  
-This app is intended for methodological comparison and visualization.  
-It is **not** a predictive device and must **not** be used as a standalone decision tool.
-""")
+import pygad
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
+pio.renderers.default = "colab"
+plt.rcParams["figure.dpi"] = 160
 
+# ======================
+# SETTINGS (PAPER)
+# ======================
+RUN_ROC_PLOTS = True
+RUN_3D = True
+RUN_PR_PLOTS = True
+RUN_CALIB_PLOTS = True
 
-# =========================
-# SETTINGS (defaults)
-# =========================
-UNIT_DEFAULT = "MPa\u00b9\u2044\u00b2"
+# Probabilistic Numerical Optimization (RED -> p)
+K_PROB = 6.0
+REG_R0 = 0.05
 
-# Probabilistic mapping (RED → p)
-K_PROB_DEFAULT = 6.0
-REG_R0_DEFAULT = 0.05
+# 3D ML “shell-sphere”
+ISO_LEVELS = [0.50, 0.80]   # user can change (2 ML spheres for comparison)
+GRID_PAD = 1.5
+GRID_N = 28
+SHELL_DELTA = 0.05          # shell: iso <= p <= iso+Δ (auto-relax if too few points)
 
-# ML shell sphere settings
-ISO_LEVELS_DEFAULT = [0.50, 0.80]
-GRID_PAD_DEFAULT = 1.5
-GRID_N_DEFAULT = 28
-SHELL_DELTA_DEFAULT = 0.05
+# Reparam optimizers
+NMS_RESTARTS = 1
+COBYLA_RESTARTS = 1
+
+# Units
+UNIT = "MPa\u00b9\u2044\u00b2"
 
 # Calibration
-CALIBRATION_MIN_N_ISO_DEFAULT = 60
+CALIBRATION_METHOD_HIGHN = "isotonic"  # if N sufficient
+CALIBRATION_METHOD_LOWN  = "sigmoid"   # if N small
+CALIBRATION_MIN_N_ISO = 60             # conservative threshold for isotonic
 
-# Bounds for numerical optimization: (δd, δp, δh, R0)
-BOUNDS_DEFAULT = [(10, 25), (0, 25), (0, 25), (2, 25)]
+# ======================
+# FIGURE STYLE HELPERS (ARTICLE-READY) — English axes/titles
+# ======================
+def _article_axes(ax):
+    ax.grid(True, alpha=0.25)
+    for spine in ax.spines.values():
+        spine.set_alpha(0.6)
 
+def plot_confusion_matrix_pretty(cm, title="Confusion Matrix", xlabel="Predicted", ylabel="True"):
+    plt.figure(figsize=(5.6, 4.8))
+    plt.imshow(cm, interpolation="nearest")
+    plt.title(title)
+    plt.xlabel(xlabel); plt.ylabel(ylabel)
+    plt.colorbar()
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center")
+    ax = plt.gca()
+    _article_axes(ax)
+    plt.tight_layout()
+    plt.show()
 
-# =========================
-# Sidebar
-# =========================
-st.sidebar.header("Controls")
+def plot_roc_pretty(y_true, curves, title="ROC Curve", subtitle=None):
+    """
+    curves: list of dicts: {"label": str, "p": probas, "lw": float}
+    """
+    if len(np.unique(y_true)) < 2:
+        return
+    plt.figure(figsize=(6.6, 5.2))
+    for c in curves:
+        fpr, tpr, _ = roc_curve(y_true, c["p"])
+        plt.plot(fpr, tpr, label=f'{c["label"]} (AUC={auc(fpr,tpr):.2f})', lw=c.get("lw", 1.6))
+    plt.plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    if subtitle:
+        plt.title(f"{title}\n{subtitle}")
+    else:
+        plt.title(title)
+    plt.legend()
+    _article_axes(plt.gca())
+    plt.tight_layout()
+    plt.show()
 
-MODE = st.sidebar.radio(
-    "Mode",
-    ["Paper mode (fast & reproducible)", "Exploratory mode (slower)"],
-    help="Paper mode uses faster optimization settings for Streamlit Cloud stability."
-)
+def plot_pr_pretty(y_true, curves, title="Precision-Recall Curve", subtitle=None):
+    if len(np.unique(y_true)) < 2:
+        return
+    plt.figure(figsize=(6.6, 5.2))
+    for c in curves:
+        prec, rec, _ = precision_recall_curve(y_true, c["p"])
+        ap = average_precision_score(y_true, c["p"])
+        plt.plot(rec, prec, label=f'{c["label"]} (AP={ap:.2f})', lw=c.get("lw", 1.6))
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    if subtitle:
+        plt.title(f"{title}\n{subtitle}")
+    else:
+        plt.title(title)
+    plt.legend()
+    _article_axes(plt.gca())
+    plt.tight_layout()
+    plt.show()
 
-UNIT = st.sidebar.text_input("Units label", value=UNIT_DEFAULT)
+def plot_calibration_pretty(y_true, probas_dict, title="Calibration (Reliability) Plot", subtitle=None, n_bins=10):
+    """
+    probas_dict: {label: probas}
+    """
+    if len(np.unique(y_true)) < 2:
+        return
+    plt.figure(figsize=(6.6, 5.2))
+    for label, p in probas_dict.items():
+        frac_pos, mean_pred = calibration_curve(y_true, p, n_bins=n_bins, strategy="quantile")
+        plt.plot(mean_pred, frac_pos, marker="o", lw=1.4, label=label)
+    plt.plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
+    plt.xlabel("Mean Predicted Probability")
+    plt.ylabel("Fraction of Positives")
+    if subtitle:
+        plt.title(f"{title}\n{subtitle}")
+    else:
+        plt.title(title)
+    plt.legend()
+    _article_axes(plt.gca())
+    plt.tight_layout()
+    plt.show()
 
-K_PROB = st.sidebar.number_input("K (RED→p logistic)", min_value=0.5, max_value=50.0, value=float(K_PROB_DEFAULT), step=0.5)
-REG_R0 = st.sidebar.number_input("R0 regularization (λ)", min_value=0.0, max_value=1.0, value=float(REG_R0_DEFAULT), step=0.01)
+# ======================
+# Upload and read Excel
+# ======================
+uploaded = files.upload()
+file_name = list(uploaded.keys())[0]
 
-ISO_LEVELS = st.sidebar.multiselect(
-    "ML iso-levels for shell spheres",
-    options=[0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9],
-    default=ISO_LEVELS_DEFAULT
-)
-GRID_PAD = st.sidebar.number_input("Grid padding", min_value=0.0, max_value=10.0, value=float(GRID_PAD_DEFAULT), step=0.1)
-GRID_N = st.sidebar.number_input("Grid resolution (N)", min_value=12, max_value=60, value=int(GRID_N_DEFAULT), step=1)
-SHELL_DELTA = st.sidebar.number_input("Shell delta (Δ)", min_value=0.01, max_value=0.30, value=float(SHELL_DELTA_DEFAULT), step=0.01)
+xls = pd.ExcelFile(file_name)
+print("Available sheets:")
+for i, aba in enumerate(xls.sheet_names):
+    print(f"{i+1}. {aba}")
+sheet_index = int(input("Choose sheet number: ")) - 1
+df = xls.parse(xls.sheet_names[sheet_index])
 
-CALIBRATION_MIN_N_ISO = st.sidebar.number_input("Min N for isotonic", min_value=10, max_value=500, value=int(CALIBRATION_MIN_N_ISO_DEFAULT), step=5)
+print("\nAvailable columns:")
+for i, col in enumerate(df.columns):
+    print(f"{i+1}. {col}")
 
-if MODE.startswith("Paper"):
-    OPT_MAXITER_DE = 250
-    OPT_MAXITER_LOCAL = 1200
+def escolher_coluna(desc, allow_skip=False):
+    """
+    allow_skip=True allows typing 0 for 'no column'
+    """
+    while True:
+        try:
+            idx = int(input(f"Column for {desc}" + (" (0 = none)" if allow_skip else "") + ": "))
+            if allow_skip and idx == 0:
+                return None
+            if 1 <= idx <= len(df.columns):
+                return df.columns[idx - 1]
+        except:
+            pass
+
+delta_d_col = escolher_coluna("δd")
+delta_p_col = escolher_coluna("δp")
+delta_h_col = escolher_coluna("δh")
+solub_col   = escolher_coluna("solubility (0, 0.5 or 1)")
+group_col   = escolher_coluna("GROUP for LOGO (e.g., solvent/family/source)", allow_skip=True)
+
+use_group = group_col is not None
+cols = [delta_d_col, delta_p_col, delta_h_col, solub_col] + ([group_col] if use_group else [])
+df_filtered = df[cols].copy()
+
+new_cols = ['delta_d', 'delta_p', 'delta_h', 'solubility'] + (['group'] if use_group else [])
+df_filtered.columns = new_cols
+df_filtered[['delta_d','delta_p','delta_h','solubility']] = df_filtered[['delta_d','delta_p','delta_h','solubility']].apply(pd.to_numeric, errors='coerce')
+df_filtered = df_filtered.dropna(subset=['delta_d','delta_p','delta_h','solubility']).drop_duplicates().reset_index(drop=True)
+
+# ======================
+# Label: PARTIAL -> binary + weights
+# ======================
+y_raw = df_filtered['solubility'].astype(float).values
+y_bin = (y_raw >= 0.5).astype(int)                 # 0.5 -> 1
+w = np.where(y_raw == 0.5, 0.5, 1.0).astype(float) # partial weighs 0.5
+df_filtered['solubility'] = y_bin
+
+n_total = len(df_filtered)
+n_pos = int(np.sum(y_bin))
+n_neg = n_total - n_pos
+n_parcial = int(np.sum(y_raw == 0.5))
+print(f"\nSamples: {n_total} | Positives(bin)={n_pos} | Negatives={n_neg} | Partial(0.5)={n_parcial}")
+
+if use_group:
+    groups = df_filtered['group'].astype(str).values
+    n_groups = len(np.unique(groups))
+    print(f"Group column for CV: '{group_col}' | #groups = {n_groups}")
 else:
-    OPT_MAXITER_DE = 800
-    OPT_MAXITER_LOCAL = 3000
+    groups = None
+    print("CV: no group -> automatic fallback to Leave-One-Out (LOO)")
 
-st.sidebar.divider()
-run_button = st.sidebar.button("Run analysis", type="primary")
+# ======================
+# Numerical Optimization (Hansen): distance
+# ======================
+BOUNDS = [(10, 25), (0, 25), (0, 25), (2, 25)]  # (δd, δp, δh, R0)
 
-
-# =========================
-# Helpers — math & models
-# =========================
 def hansen_distance(d_d, d_p, d_h, dp, pp, hp):
     return np.sqrt(4*(d_d - dp)**2 + (d_p - pp)**2 + (d_h - hp)**2)
 
@@ -121,19 +264,35 @@ def red_values(df_local, params):
                          dp, pp, hp)
     return Ra / max(R0, 1e-6)
 
-def df_logloss(df_local, x, weights=None, k=6.0, reg_ro=0.05, ro_ref=None):
-    d_d = df_local['delta_d'].values
-    d_p = df_local['delta_p'].values
-    d_h = df_local['delta_h'].values
-    y = df_local['solubility'].values.astype(int)
-
+# ======================
+# Objective functions (>=5)
+# ======================
+def df_geom(d_d, d_p, d_h, y, x, weights=None):
     dp, pp, hp, R0 = map(float, x)
     R0 = max(R0, 1e-6)
     Ra = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+
+    A = np.ones_like(Ra, dtype=float)
+    A[(Ra > R0) & (y == 1)] = np.exp(R0 - Ra[(Ra > R0) & (y == 1)])  # pos outside
+    A[(Ra <= R0) & (y == 0)] = np.exp(Ra[(Ra <= R0) & (y == 0)] - R0) # neg inside
+
+    if weights is None:
+        gm = np.exp(np.mean(np.log(A + 1e-12)))
+    else:
+        ww = np.asarray(weights, float)
+        gm = np.exp(np.sum(ww * np.log(A + 1e-12)) / np.sum(ww))
+    return float(abs(gm - 1.0))
+
+def df_logloss(d_d, d_p, d_h, y_bin, x, weights=None, k=6.0, reg_ro=0.05, ro_ref=None):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra  = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
     RED = Ra / R0
     p = prob_from_red(RED, k=k)
 
+    y = np.asarray(y_bin).astype(int)
     ll = -(y*np.log(p) + (1-y)*np.log(1-p))
+
     if weights is None:
         loss = float(np.mean(ll))
     else:
@@ -146,39 +305,289 @@ def df_logloss(df_local, x, weights=None, k=6.0, reg_ro=0.05, ro_ref=None):
         loss = loss + float(reg_ro)*((R0 - ro_ref)/max(ro_ref, 1e-6))**2
     return float(loss)
 
-def fit_numerical_optimization(df_local, w_local, bounds):
-    """
-    Fast + robust: Differential Evolution (global) + local refinement (Powell).
-    Objective: weighted logloss on probabilistic RED mapping (+ R0 regularization).
-    """
+def df_brier(d_d, d_p, d_h, y_bin, x, weights=None, k=6.0, reg_ro=0.05, ro_ref=None):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra  = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+    RED = Ra / R0
+    p = prob_from_red(RED, k=k)
+
+    y = np.asarray(y_bin).astype(float)
+    b = (p - y)**2
+
+    if weights is None:
+        loss = float(np.mean(b))
+    else:
+        ww = np.asarray(weights, float)
+        loss = float(np.sum(ww*b) / np.sum(ww))
+
+    if reg_ro and reg_ro > 0:
+        if ro_ref is None:
+            ro_ref = float(np.median(Ra))
+        loss = loss + float(reg_ro)*((R0 - ro_ref)/max(ro_ref, 1e-6))**2
+    return float(loss)
+
+def df_hinge(d_d, d_p, d_h, y_bin, x, weights=None):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra  = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+    RED = Ra / R0
+    y = np.asarray(y_bin).astype(int)
+
+    pos = (y == 1)
+    neg = (y == 0)
+    loss_pos = np.maximum(0.0, RED[pos] - 1.0)
+    loss_neg = np.maximum(0.0, 1.0 - RED[neg])
+
+    loss_vec = np.concatenate([loss_pos, loss_neg], axis=0)
+    if loss_vec.size == 0:
+        return 0.0
+
+    if weights is None:
+        return float(np.mean(loss_vec))
+    ww = np.asarray(weights, float)
+    ww_vec = np.concatenate([ww[pos], ww[neg]], axis=0)
+    return float(np.sum(ww_vec*loss_vec) / np.sum(ww_vec))
+
+def df_softcount(d_d, d_p, d_h, y_bin, x, weights=None, beta=8.0):
+    dp, pp, hp, R0 = map(float, x)
+    R0 = max(R0, 1e-6)
+    Ra  = hansen_distance(d_d, d_p, d_h, dp, pp, hp)
+    RED = Ra / R0
+    y = np.asarray(y_bin).astype(int)
+
+    s_out = 1.0 / (1.0 + np.exp(-beta*(RED - 1.0)))  # ~1 outside
+    err = np.where(y == 1, s_out, (1.0 - s_out))      # pos outside / neg inside
+
+    if weights is None:
+        return float(np.mean(err))
+    ww = np.asarray(weights, float)
+    return float(np.sum(ww*err) / np.sum(ww))
+
+DF_LIST_TO_COMPARE = ["DF_GEOM","DF_LOGLOSS","DF_BRIER","DF_HINGE","DF_SOFTCOUNT"]
+
+def z_to_x(z, bounds=BOUNDS):
+    lo = np.array([b[0] for b in bounds], float)
+    hi = np.array([b[1] for b in bounds], float)
+    s  = 1.0 / (1.0 + np.exp(-np.asarray(z, float)))
+    return lo + s*(hi - lo)
+
+def fit_by_methods(df_local, weights_local, df_name="DF_GEOM",
+                   nms_restarts=1, cobyla_restarts=1):
     d_d = df_local['delta_d'].values
     d_p = df_local['delta_p'].values
     d_h = df_local['delta_h'].values
+    yloc = df_local['solubility'].values.astype(int)
 
     Ra_ref = hansen_distance(d_d, d_p, d_h, np.median(d_d), np.median(d_p), np.median(d_h))
     ro_ref = float(np.median(Ra_ref))
 
-    def obj(x):
-        return df_logloss(df_local, x, weights=w_local, k=K_PROB, reg_ro=REG_R0, ro_ref=ro_ref)
+    if df_name == "DF_GEOM":
+        def DF(x):
+            return df_geom(d_d, d_p, d_h, yloc, x, weights=weights_local)
+    elif df_name == "DF_LOGLOSS":
+        def DF(x):
+            return df_logloss(d_d, d_p, d_h, yloc, x, weights=weights_local, k=K_PROB, reg_ro=REG_R0, ro_ref=ro_ref)
+    elif df_name == "DF_BRIER":
+        def DF(x):
+            return df_brier(d_d, d_p, d_h, yloc, x, weights=weights_local, k=K_PROB, reg_ro=REG_R0, ro_ref=ro_ref)
+    elif df_name == "DF_HINGE":
+        def DF(x):
+            return df_hinge(d_d, d_p, d_h, yloc, x, weights=weights_local)
+    elif df_name == "DF_SOFTCOUNT":
+        def DF(x):
+            return df_softcount(d_d, d_p, d_h, yloc, x, weights=weights_local, beta=8.0)
+    else:
+        raise ValueError("Unknown DF.")
+
+    starts = [
+        ("start=median", [np.median(d_d), np.median(d_p), np.median(d_h), 10.0]),
+        ("start=mean",   [np.mean(d_d),   np.mean(d_p),   np.mean(d_h),   12.0]),
+    ]
+
+    rows = []
+
+    def _append_row(metodo, execucao, pars):
+        pars = np.asarray(pars, float)
+        pars[3] = max(float(pars[3]), 1e-6)
+
+        RED = red_values(df_local, pars)
+        p = prob_from_red(RED, k=K_PROB)
+
+        AUCv = roc_auc_score(yloc, p) if len(np.unique(yloc)) == 2 else np.nan
+        AUPRC = average_precision_score(yloc, p) if len(np.unique(yloc)) == 2 else np.nan
+
+        df_geom_val = df_geom(d_d, d_p, d_h, yloc, pars, weights=weights_local)
+        df_ll_val   = df_logloss(d_d, d_p, d_h, yloc, pars, weights=weights_local, k=K_PROB, reg_ro=REG_R0, ro_ref=ro_ref)
+
+        rows.append(dict(
+            DF=df_name,
+            Método=metodo, Execucao=execucao,
+            delta_d=float(pars[0]), delta_p=float(pars[1]), delta_h=float(pars[2]), R0=float(pars[3]),
+            DF_GEOM=float(df_geom_val),
+            DF_LOGLOSS=float(df_ll_val),
+            DF_MAIN=float(DF(pars)),
+            AUC_unweighted=float(AUCv) if AUCv==AUCv else np.nan,
+            AUPRC_unweighted=float(AUPRC) if AUPRC==AUPRC else np.nan
+        ))
+
+    # Local
+    for met in ['Powell','L-BFGS-B','TNC']:
+        for tag, guess in starts:
+            try:
+                res = minimize(
+                    DF, guess, method=met,
+                    bounds=BOUNDS if met in ['L-BFGS-B','TNC'] else None,
+                    options=dict(maxiter=2000)
+                )
+                _append_row(met, tag, res.x)
+            except Exception:
+                pass
 
     # Global
-    res_de = differential_evolution(
-        obj, bounds, maxiter=OPT_MAXITER_DE, polish=False, seed=42, disp=False
-    )
+    try:
+        res_de = differential_evolution(DF, BOUNDS, maxiter=800, polish=True, seed=42)
+        _append_row('Differential Evolution', 'global', res_de.x)
+    except Exception:
+        pass
 
-    # Local refine
-    res_local = minimize(
-        obj, res_de.x, method="Powell",
-        options=dict(maxiter=OPT_MAXITER_LOCAL)
-    )
+    try:
+        res_da = dual_annealing(DF, bounds=np.array(BOUNDS, float), maxiter=600)
+        _append_row('Dual Annealing', 'global', res_da.x)
+    except Exception:
+        pass
 
-    x_best = res_local.x if res_local.success else res_de.x
-    dp, pp, hp, R0 = map(float, x_best)
-    R0 = max(R0, 1e-6)
-    return np.array([dp, pp, hp, R0], float), float(obj([dp, pp, hp, R0]))
+    try:
+        res_sh = shgo(DF, BOUNDS, n=128, iters=3)
+        _append_row('SHGO', 'global', res_sh.x)
+    except Exception:
+        pass
 
+    # GA
+    def fitness_func(ga_instance, solution, solution_idx):
+        return float(-DF(solution))
+    try:
+        ga = pygad.GA(
+            num_generations=180, num_parents_mating=12,
+            fitness_func=fitness_func,
+            sol_per_pop=40, num_genes=4,
+            mutation_probability=0.15, crossover_probability=0.9,
+            parent_selection_type="sss", keep_parents=2,
+            stop_criteria=["saturate_50"],
+            gene_space=[{'low': b[0], 'high': b[1]} for b in BOUNDS],
+            random_seed=42
+        )
+        ga.run()
+        _append_row('Genetic Algorithm', 'global', ga.best_solution()[0])
+    except Exception:
+        pass
+
+    # Nelder–Mead (reparam)
+    try:
+        for r in range(nms_restarts):
+            z0 = np.zeros(4) if r==0 else np.random.normal(0.0, 0.7, 4)
+            tag = "z0=center" if r==0 else f"z0=rand#{r}"
+            def DF_unconstrained(z):
+                return DF(z_to_x(z, BOUNDS))
+            res_nm = minimize(DF_unconstrained, z0, method='Nelder-Mead',
+                              options=dict(maxiter=3000, maxfev=6000, xatol=1e-6, fatol=1e-9))
+            _append_row('Nelder-Mead (reparam)', tag, z_to_x(res_nm.x, BOUNDS))
+    except Exception:
+        pass
+
+    # COBYLA (reparam)
+    try:
+        for r in range(cobyla_restarts):
+            z0 = np.zeros(4) if r==0 else np.random.normal(0.0, 0.7, 4)
+            tag = "z0=center" if r==0 else f"z0=rand#{r}"
+            def DF_unconstrained(z):
+                return DF(z_to_x(z, BOUNDS))
+            res_c = minimize(DF_unconstrained, z0, method='COBYLA',
+                             options=dict(maxiter=3000, rhobeg=1.0, catol=1e-8))
+            _append_row('COBYLA (reparam)', tag, z_to_x(res_c.x, BOUNDS))
+    except Exception:
+        pass
+
+    df_params = pd.DataFrame(rows)
+    if not df_params.empty:
+        df_params = df_params.sort_values(
+            by=['DF_MAIN','DF_LOGLOSS','DF_GEOM','AUPRC_unweighted','AUC_unweighted'],
+            ascending=[True, True, True, False, False]
+        ).reset_index(drop=True)
+    return df_params
+
+# ======================
+# Select best Numerical Optimization global (compare >=5 DFs)
+# ======================
+all_runs = []
+best_overall = None
+
+for df_name in DF_LIST_TO_COMPARE:
+    print(f"\n--- Running Numerical Optimization for {df_name} ---")
+    runs = fit_by_methods(df_filtered, weights_local=w,
+                          df_name=df_name,
+                          nms_restarts=NMS_RESTARTS,
+                          cobyla_restarts=COBYLA_RESTARTS)
+    if runs.empty:
+        print(f"[WARN] No results for {df_name}")
+        continue
+
+    all_runs.append(runs)
+    row0 = runs.iloc[0].to_dict()
+    print(f"Best ({df_name}): {row0['Método']} | DF_MAIN={row0['DF_MAIN']:.6f} | "
+          f"δd={row0['delta_d']:.3f}, δp={row0['delta_p']:.3f}, δh={row0['delta_h']:.3f}, R0={row0['R0']:.3f}")
+
+    if best_overall is None:
+        best_overall = row0
+    else:
+        # global criterion (paper): prioritize DF_LOGLOSS and DF_GEOM + AUPRC
+        if (row0['DF_LOGLOSS'], row0['DF_GEOM'], -row0['AUPRC_unweighted']) < (best_overall['DF_LOGLOSS'], best_overall['DF_GEOM'], -best_overall['AUPRC_unweighted']):
+            best_overall = row0
+
+df_all_runs = pd.concat(all_runs, ignore_index=True) if len(all_runs) else pd.DataFrame()
+if best_overall is None:
+    raise RuntimeError("No Numerical Optimization run returned results. Check data/columns.")
+
+best_df_name = str(best_overall["DF"])
+best_optimizer = str(best_overall["Método"])
+dp, pp, hp, R0 = float(best_overall["delta_d"]), float(best_overall["delta_p"]), float(best_overall["delta_h"]), float(best_overall["R0"])
+
+print("\n====================")
+print("🏆 BEST (NUMERICAL OPTIMIZATION) GLOBAL")
+print(f"DF: {best_df_name} | Optimizer: {best_optimizer}")
+print(f"Center: δd={dp:.4f} {UNIT} | δp={pp:.4f} {UNIT} | δh={hp:.4f} {UNIT}")
+print(f"Radius: R0={R0:.4f} {UNIT}")
+print("====================\n")
+
+# ======================
+# Numerical Optimization in-sample
+# ======================
+y = df_filtered['solubility'].values.astype(int)
+RED_all = red_values(df_filtered, (dp, pp, hp, R0))
+p_numopt_in = prob_from_red(RED_all, k=K_PROB)
+
+thr_numopt_in = 0.5
+if len(np.unique(y)) == 2:
+    fpr, tpr, thr = roc_curve(y, p_numopt_in)
+    j = tpr - fpr
+    thr_numopt_in = float(thr[int(np.argmax(j))])
+
+pred_numopt_in = (p_numopt_in >= thr_numopt_in).astype(int)
+cm_numopt_in = confusion_matrix(y, pred_numopt_in)
+
+plot_confusion_matrix_pretty(
+    cm_numopt_in,
+    title=f"Numerical Optimization — Confusion Matrix (in-sample, thr={thr_numopt_in:.3f})",
+    xlabel="Predicted label",
+    ylabel="True label"
+)
+
+# ======================
+# ML base models + CALIBRATION (Improvement #2)
+# ======================
 def make_base_models(random_state=42, base_score=None):
     models = {}
+
     models["XGBoost"] = XGBClassifier(
         n_estimators=450, max_depth=3, learning_rate=0.05,
         subsample=0.9, colsample_bytree=0.9,
@@ -192,14 +601,36 @@ def make_base_models(random_state=42, base_score=None):
     models["SVM-RBF"] = SVC(
         C=2.0, gamma="scale", probability=True, random_state=random_state
     )
+
+    try:
+        from lightgbm import LGBMClassifier
+        models["LightGBM"] = LGBMClassifier(
+            n_estimators=700, learning_rate=0.03,
+            num_leaves=31, subsample=0.9, colsample_bytree=0.9,
+            random_state=random_state
+        )
+    except Exception:
+        pass
+
+    try:
+        from catboost import CatBoostClassifier
+        models["CatBoost"] = CatBoostClassifier(
+            iterations=800, depth=4, learning_rate=0.05,
+            loss_function="Logloss",
+            verbose=False, random_seed=random_state
+        )
+    except Exception:
+        pass
+
     return models
 
 def calibrate_model(base_estimator, X_tr, y_tr, w_tr):
     """
-    isotonic if N >= threshold; else sigmoid.
-    Tries sample_weight; falls back if not supported.
+    Probability calibration using internal CV (3-fold) when possible.
+    - isotonic if N>=CALIBRATION_MIN_N_ISO and both classes are present, else sigmoid.
+    - if something fails, returns the uncalibrated estimator.
     """
-    method = "isotonic" if len(y_tr) >= CALIBRATION_MIN_N_ISO else "sigmoid"
+    method = CALIBRATION_METHOD_HIGHN if len(y_tr) >= CALIBRATION_MIN_N_ISO else CALIBRATION_METHOD_LOWN
     try:
         cal = CalibratedClassifierCV(base_estimator, method=method, cv=3)
         try:
@@ -216,10 +647,132 @@ def calibrate_model(base_estimator, X_tr, y_tr, w_tr):
             base_estimator.fit(X_tr, y_tr)
         return base_estimator
 
+# ML data
+X = df_filtered[['delta_d','delta_p','delta_h']].values
+p0_in = float(np.clip(np.average(y, weights=w), 1e-12, 1-1e-12))
+base_models = make_base_models(42, base_score=p0_in)
 
-# =========================
-# Helpers — metrics
-# =========================
+# In-sample (calibrated)
+proba_ml_in = {}
+fitted_ml_in = {}
+for name, est in base_models.items():
+    try:
+        fitted = calibrate_model(est, X, y, w)
+        fitted_ml_in[name] = fitted
+        if hasattr(fitted, "predict_proba"):
+            proba_ml_in[name] = fitted.predict_proba(X)[:, 1]
+    except Exception as e:
+        print(f"[WARN] {name} failed in-sample: {e}")
+
+# ROC / PR / Calibration (in-sample)
+if RUN_ROC_PLOTS and (len(np.unique(y))==2):
+    curves = [{"label": "Numerical Optimization", "p": p_numopt_in, "lw": 2.2}]
+    for name, p in proba_ml_in.items():
+        curves.append({"label": f"{name} (cal)", "p": p, "lw": 1.5})
+    plot_roc_pretty(y, curves, title="ROC Curve", subtitle="In-sample (calibrated ML)")
+
+if RUN_PR_PLOTS and (len(np.unique(y))==2):
+    curves = [{"label": "Numerical Optimization", "p": p_numopt_in, "lw": 2.2}]
+    for name, p in proba_ml_in.items():
+        curves.append({"label": f"{name} (cal)", "p": p, "lw": 1.5})
+    plot_pr_pretty(y, curves, title="Precision–Recall Curve", subtitle="In-sample (calibrated ML)")
+
+if RUN_CALIB_PLOTS and (len(np.unique(y))==2):
+    calib_dict = {"Numerical Optimization": p_numopt_in}
+    # keep only a few lines if many models exist (still deterministic order)
+    for name in sorted(proba_ml_in.keys()):
+        calib_dict[f"{name} (cal)"] = proba_ml_in[name]
+    plot_calibration_pretty(y, calib_dict, title="Calibration (Reliability) Plot", subtitle="In-sample", n_bins=10)
+
+# ======================
+# CV by group (LOGO) or LOO (Improvement #1)
+# ======================
+if use_group:
+    splitter = LeaveOneGroupOut()
+    splits = list(splitter.split(X, y, groups=groups))
+else:
+    splitter = LeaveOneOut()
+    splits = list(splitter.split(X, y))
+
+p_numopt_cv = np.zeros(len(y), dtype=float)
+p_ml_cv = {name: np.zeros(len(y), dtype=float) for name in base_models.keys()}
+
+# In CV we:
+# - Numerical Optimization: refit on train (best_df_name) and predict on test
+# - ML: calibrate on train and predict on test (with weights)
+for (tr_idx, te_idx) in splits:
+    df_tr = df_filtered.iloc[tr_idx].reset_index(drop=True)
+    df_te = df_filtered.iloc[te_idx].reset_index(drop=True)
+
+    w_tr = w[tr_idx]
+    y_tr = df_tr['solubility'].values.astype(int)
+
+    # Numerical Optimization train-only
+    try:
+        runs_cv = fit_by_methods(df_tr, weights_local=w_tr, df_name=best_df_name,
+                                 nms_restarts=0, cobyla_restarts=0)
+        if runs_cv.empty:
+            pars_cv = np.array([dp, pp, hp, R0], float)
+        else:
+            r0 = runs_cv.iloc[0]
+            pars_cv = np.array([r0["delta_d"], r0["delta_p"], r0["delta_h"], r0["R0"]], float)
+    except Exception:
+        pars_cv = np.array([dp, pp, hp, R0], float)
+
+    RED_te = red_values(df_te, pars_cv)
+    p_numopt_cv[te_idx] = prob_from_red(RED_te, k=K_PROB)
+
+    # ML train-only (calibrated)
+    X_tr = df_tr[['delta_d','delta_p','delta_h']].values
+    X_te = df_te[['delta_d','delta_p','delta_h']].values
+
+    # guard: train with 1 class (can happen in LOGO)
+    if len(np.unique(y_tr)) < 2:
+        prev = float(np.clip(np.average(y, weights=w), 1e-12, 1-1e-12))
+        for name in base_models.keys():
+            p_ml_cv[name][te_idx] = prev
+        continue
+
+    p0_fold = float(np.clip(np.average(y_tr, weights=w_tr), 1e-12, 1-1e-12))
+    fold_models = make_base_models(42, base_score=p0_fold)
+
+    for name, est in fold_models.items():
+        try:
+            fitted = calibrate_model(est, X_tr, y_tr, w_tr)
+            if hasattr(fitted, "predict_proba"):
+                p_ml_cv[name][te_idx] = fitted.predict_proba(X_te)[:, 1]
+            else:
+                p_ml_cv[name][te_idx] = p0_fold
+        except Exception:
+            p_ml_cv[name][te_idx] = p0_fold
+
+# ROC / PR / Calibration (CV)
+cv_label = "LOGO" if use_group else "LOO"
+
+if RUN_ROC_PLOTS and (len(np.unique(y))==2):
+    curves = [{"label": f"Numerical Optimization ({cv_label})", "p": p_numopt_cv, "lw": 2.2}]
+    for name, p in p_ml_cv.items():
+        curves.append({"label": f"{name} ({cv_label}, cal)", "p": p, "lw": 1.5})
+    plot_roc_pretty(y, curves, title="ROC Curve", subtitle=f"Cross-validation ({cv_label})")
+
+if RUN_PR_PLOTS and (len(np.unique(y))==2):
+    curves = [{"label": f"Numerical Optimization ({cv_label})", "p": p_numopt_cv, "lw": 2.2}]
+    for name, p in p_ml_cv.items():
+        curves.append({"label": f"{name} ({cv_label}, cal)", "p": p, "lw": 1.5})
+    plot_pr_pretty(y, curves, title="Precision–Recall Curve", subtitle=f"Cross-validation ({cv_label})")
+
+if RUN_CALIB_PLOTS and (len(np.unique(y))==2):
+    calib_dict = {f"Numerical Optimization ({cv_label})": p_numopt_cv}
+    for name in sorted(p_ml_cv.keys()):
+        calib_dict[f"{name} ({cv_label}, cal)"] = p_ml_cv[name]
+    plot_calibration_pretty(y, calib_dict, title="Calibration (Reliability) Plot", subtitle=f"Cross-validation ({cv_label})", n_bins=10)
+
+# ======================
+# Full metrics
+# ======================
+def _safe_div(a, b):
+    return float(a) / float(b) if float(b) != 0 else np.nan
+
 def weighted_confusion(y_true, y_pred, sample_weight=None):
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
@@ -230,47 +783,142 @@ def weighted_confusion(y_true, y_pred, sample_weight=None):
     TP = sw[(y_true==1) & (y_pred==1)].sum()
     return TN, FP, FN, TP
 
-def safe_div(a, b):
-    return float(a)/float(b) if float(b) != 0 else np.nan
+def weighted_brier(y_true, p, sample_weight=None):
+    y_true = np.asarray(y_true).astype(float)
+    p = np.asarray(p).astype(float)
+    if sample_weight is None:
+        return float(np.mean((p - y_true)**2))
+    sw = np.asarray(sample_weight, dtype=float)
+    return float(np.sum(sw*(p - y_true)**2) / np.sum(sw))
 
-def compute_metrics_row(model_name, y_true, p, thr=0.5, sample_weight=None):
+def weighted_logloss(y_true, p, sample_weight=None, eps=1e-12):
+    y_true = np.asarray(y_true).astype(float)
+    p = np.clip(np.asarray(p).astype(float), eps, 1-eps)
+    ll = -(y_true*np.log(p) + (1-y_true)*np.log(1-p))
+    if sample_weight is None:
+        return float(np.mean(ll))
+    sw = np.asarray(sample_weight, dtype=float)
+    return float(np.sum(sw*ll) / np.sum(sw))
+
+def weighted_accuracy(y_true, y_pred, sample_weight=None):
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    if sample_weight is None:
+        return float(np.mean(y_true == y_pred))
+    sw = np.asarray(sample_weight, dtype=float)
+    return float(np.sum(sw*(y_true == y_pred)) / np.sum(sw))
+
+def compute_metrics_full(model_name, y_true, p, thr=0.5, sample_weight=None):
     y_true = np.asarray(y_true).astype(int)
     p = np.clip(np.asarray(p).astype(float), 1e-12, 1-1e-12)
     y_pred = (p >= float(thr)).astype(int)
 
     TN, FP, FN, TP = weighted_confusion(y_true, y_pred, sample_weight=sample_weight)
-    precision = safe_div(TP, TP+FP)
-    recall = safe_div(TP, TP+FN)
-    specificity = safe_div(TN, TN+FP)
-    f1 = safe_div(2*precision*recall, precision+recall)
+
+    precision = _safe_div(TP, TP+FP)
+    recall = _safe_div(TP, TP+FN)
+    specificity = _safe_div(TN, TN+FP)
+    f1 = _safe_div(2*precision*recall, precision+recall)
+    npv = _safe_div(TN, TN+FN)
+    fpr = _safe_div(FP, FP+TN)
+    fnr = _safe_div(FN, FN+TP)
     bal_acc = np.nan if (recall!=recall or specificity!=specificity) else 0.5*(recall+specificity)
 
     denom = np.sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
-    mcc = safe_div((TP*TN - FP*FN), denom)
+    mcc = _safe_div((TP*TN - FP*FN), denom)
 
     out = dict(
         Model=model_name,
         thr=float(thr),
-        Accuracy=safe_div((TP+TN), (TP+TN+FP+FN)),
+        LogLoss=weighted_logloss(y_true, p, sample_weight=sample_weight),
+        Brier=weighted_brier(y_true, p, sample_weight=sample_weight),
+        Accuracy=weighted_accuracy(y_true, y_pred, sample_weight=sample_weight),
         BalancedAcc=bal_acc,
         Precision=precision,
         Recall=recall,
         Specificity=specificity,
         F1=f1,
+        NPV=npv,
         MCC=mcc,
+        FPR=fpr,
+        FNR=fnr,
         TN=float(TN), FP=float(FP), FN=float(FN), TP=float(TP),
-        AUC_ROC=np.nan,
-        AUC_PR=np.nan
+        AUC_ROC_unweighted=np.nan,
+        AUC_PR_unweighted=np.nan
     )
     if len(np.unique(y_true)) == 2:
-        out["AUC_ROC"] = float(roc_auc_score(y_true, p))
-        out["AUC_PR"] = float(average_precision_score(y_true, p))
+        out["AUC_ROC_unweighted"] = float(roc_auc_score(y_true, p))
+        out["AUC_PR_unweighted"] = float(average_precision_score(y_true, p))
     return out
 
+def build_metrics_tables(y, w, p_in, thr_in, p_cv, thr_cv,
+                         ml_in_dict, ml_cv_dict, thr_ml=0.5, cv_label="CV"):
+    rows_in_unw, rows_in_w = [], []
+    rows_cv_unw, rows_cv_w = [], []
 
-# =========================
-# Helpers — 3D shell-sphere
-# =========================
+    rows_in_unw.append(compute_metrics_full("NumericalOptimization_IN (unweighted)", y, p_in, thr=thr_in, sample_weight=None))
+    rows_in_w.append(compute_metrics_full("NumericalOptimization_IN (weighted)", y, p_in, thr=thr_in, sample_weight=w))
+
+    rows_cv_unw.append(compute_metrics_full(f"NumericalOptimization_{cv_label} (unweighted)", y, p_cv, thr=thr_cv, sample_weight=None))
+    rows_cv_w.append(compute_metrics_full(f"NumericalOptimization_{cv_label} (weighted)", y, p_cv, thr=thr_cv, sample_weight=w))
+
+    for k, p in ml_in_dict.items():
+        rows_in_unw.append(compute_metrics_full(f"{k}_IN (unweighted)", y, p, thr=thr_ml, sample_weight=None))
+        rows_in_w.append(compute_metrics_full(f"{k}_IN (weighted)", y, p, thr=thr_ml, sample_weight=w))
+
+    for k, p in ml_cv_dict.items():
+        rows_cv_unw.append(compute_metrics_full(f"{k}_{cv_label} (unweighted)", y, p, thr=thr_ml, sample_weight=None))
+        rows_cv_w.append(compute_metrics_full(f"{k}_{cv_label} (weighted)", y, p, thr=thr_ml, sample_weight=w))
+
+    df_in_unw = pd.DataFrame(rows_in_unw)
+    df_in_w = pd.DataFrame(rows_in_w)
+    df_cv_unw = pd.DataFrame(rows_cv_unw)
+    df_cv_w = pd.DataFrame(rows_cv_w)
+
+    sort_cols = ["LogLoss","Brier","AUC_PR_unweighted","AUC_ROC_unweighted","MCC"]
+    asc = [True, True, False, False, False]
+
+    for dfx in [df_in_unw, df_in_w, df_cv_unw, df_cv_w]:
+        dfx.sort_values(by=sort_cols, ascending=asc, inplace=True)
+        dfx.reset_index(drop=True, inplace=True)
+
+    return df_in_unw, df_in_w, df_cv_unw, df_cv_w
+
+thr_numopt_cv = 0.5  # paper-friendly (p(RED) >= 0.5)
+
+df_metrics_in_unw, df_metrics_in_w, df_metrics_cv_unw, df_metrics_cv_w = build_metrics_tables(
+    y=y, w=w,
+    p_in=p_numopt_in, thr_in=thr_numopt_in,
+    p_cv=p_numopt_cv, thr_cv=thr_numopt_cv,
+    ml_in_dict=proba_ml_in,
+    ml_cv_dict=p_ml_cv,
+    thr_ml=0.5,
+    cv_label=cv_label
+)
+
+print("\n=== METRICS IN-SAMPLE (UNWEIGHTED) ===")
+print(df_metrics_in_unw.to_string(index=False, float_format="%.6f"))
+
+print(f"\n=== METRICS {cv_label} (UNWEIGHTED) ===")
+print(df_metrics_cv_unw.to_string(index=False, float_format="%.6f"))
+
+# Best ML in CV (ranking)
+ml_only = df_metrics_cv_unw[
+    df_metrics_cv_unw["Model"].str.contains(f"_{cv_label}") &
+    (~df_metrics_cv_unw["Model"].str.startswith("NumericalOptimization"))
+]
+if not ml_only.empty:
+    best_ml_row = ml_only.iloc[0].to_dict()
+    best_ml_name = best_ml_row["Model"].replace(f"_{cv_label} (unweighted)", "").replace(f"_{cv_label} (weighted)", "").replace(f"_{cv_label}", "")
+else:
+    best_ml_name = "XGBoost"
+
+print(f"\n🏅 Best ML ({cv_label}, unweighted ranking): {best_ml_name}")
+
+# ======================
+# 3D: Numerical Optimization sphere + ML shell-sphere (Improvement #3)
+# ======================
+
 def point_colors_from_yraw(y_raw):
     yraw = np.asarray(y_raw, float)
     colors = np.where(yraw == 1.0, "blue", np.where(yraw == 0.5, "orange", "red"))
@@ -302,6 +950,11 @@ def sphere_mesh(center, r, nu=80, nv=40):
     return xs, ys, zs
 
 def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_delta=0.05, min_points=120):
+    """
+    Fit sphere using points on the "shell" near iso:
+      iso <= p <= iso + shell_delta
+    If too few points, relax by increasing delta and decreasing iso slightly.
+    """
     mn = df_local[["delta_d","delta_p","delta_h"]].min().values.astype(float) - float(pad)
     mx = df_local[["delta_d","delta_p","delta_h"]].max().values.astype(float) + float(pad)
 
@@ -331,13 +984,21 @@ def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_del
     if Psel.shape[0] < 10:
         raise ValueError("Not enough grid points. Increase GRID_N/GRID_PAD or reduce iso.")
     center, r = fit_sphere_least_squares(Psel)
-    return center, r, int(Psel.shape[0]), float(iso), -1.0
+    return center, r, int(Psel.shape[0]), float(iso), -1.0  # delta=-1 indicates fallback
 
+# Model for 3D: train on all data and calibrate
+p0_all = float(np.clip(np.average(y, weights=w), 1e-12, 1-1e-12))
+full_base = make_base_models(42, base_score=p0_all)
+if best_ml_name not in full_base:
+    print(f"[3D] Model '{best_ml_name}' not available. Using XGBoost.")
+    best_ml_name = "XGBoost"
 
-# =========================
-# Plotly style (no opacity duplication)
-# =========================
-def pretty_scene(unit=UNIT_DEFAULT):
+model_for_3d = calibrate_model(full_base[best_ml_name], X, y, w)
+
+ml_spheres_table_rows = []
+
+# ---------- Plotly 3D ARTICLE STYLE ----------
+def _pretty_scene(unit=UNIT):
     return dict(
         xaxis=dict(title=f"δd ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
                    gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
@@ -349,15 +1010,34 @@ def pretty_scene(unit=UNIT_DEFAULT):
         camera=dict(eye=dict(x=1.35, y=1.25, z=0.95))
     )
 
-def surface_style(base_rgb):
+def _pretty_layout(title):
     return dict(
+        title=title,
+        width=1100, height=820,
+        margin=dict(l=10, r=10, t=70, b=10),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="left", x=0.01,
+            bgcolor="rgba(255,255,255,0.75)",
+            bordercolor="rgba(0,0,0,0.15)",
+            borderwidth=1
+        )
+    )
+
+OPTI_COLOR = "rgb(60,110,220)"   # Numerical Optimization (blue)
+ML_COLOR   = "rgb(140,80,200)"   # ML (purple)
+
+def _surface_style(base_rgb, opacity=0.16):
+    return dict(
+        opacity=opacity,
         showscale=False,
-        colorscale=[[0.0, base_rgb], [1.0, base_rgb]],
+        colorscale=[[0.0, base_rgb],[1.0, base_rgb]],
         lighting=dict(ambient=0.55, diffuse=0.85, specular=0.25, roughness=0.55, fresnel=0.08),
         lightposition=dict(x=100, y=200, z=100)
     )
 
-def points_style(colors):
+def _points_style(colors):
     return dict(
         size=5,
         color=colors,
@@ -365,483 +1045,165 @@ def points_style(colors):
         line=dict(width=0.6, color="rgba(0,0,0,0.35)")
     )
 
+if RUN_3D:
+    colors, labels = point_colors_from_yraw(y_raw)
 
-# =========================
-# Upload + column mapping UI
-# =========================
-st.header("1) Upload dataset")
+    # (A) Numerical Optimization sphere (RED=1)  --- FIX: remove duplicate opacity/showscale
+    xs_h, ys_h, zs_h = sphere_mesh((dp, pp, hp), R0)
+    fig_h = go.Figure()
+    fig_h.add_trace(go.Surface(
+        x=xs_h, y=ys_h, z=zs_h,
+        name="Numerical Optimization (RED=1)",
+        legendgroup="opti",
+        **_surface_style(OPTI_COLOR, opacity=0.18)
+    ))
+    fig_h.add_trace(go.Scatter3d(
+        x=df_filtered["delta_d"], y=df_filtered["delta_p"], z=df_filtered["delta_h"],
+        mode="markers", marker=_points_style(colors),
+        text=labels, name="Samples", legendgroup="pts"
+    ))
+    fig_h.update_layout(**_pretty_layout(
+        title=f"3D (A) — Numerical Optimization sphere (RED=1) | DF={best_df_name} | Optimizer={best_optimizer}"
+    ))
+    fig_h.update_layout(scene=_pretty_scene())
+    fig_h.show()
 
-uploaded = st.file_uploader("Upload an Excel file (.xlsx)", type=["xlsx"])
-df_raw = None
-sheet_name = None
-
-if uploaded is not None:
-    xls = pd.ExcelFile(uploaded)
-    sheet_name = st.selectbox("Select sheet", xls.sheet_names)
-    df_raw = xls.parse(sheet_name)
-    st.success(f"Loaded sheet: {sheet_name}  |  rows={df_raw.shape[0]} cols={df_raw.shape[1]}")
-    st.dataframe(df_raw.head(15), use_container_width=True)
-
-if df_raw is None:
-    st.info("Upload an Excel file to continue.")
-    st.stop()
-
-st.header("2) Select columns")
-
-col_delta_d = st.selectbox("δd column", df_raw.columns)
-col_delta_p = st.selectbox("δp column", df_raw.columns)
-col_delta_h = st.selectbox("δh column", df_raw.columns)
-col_solub  = st.selectbox("Solubility label column (0, 0.5, 1)", df_raw.columns)
-col_group  = st.selectbox("Group column (optional, for LOGO)", ["(none)"] + list(df_raw.columns))
-
-use_group = (col_group != "(none)")
-
-st.caption("Labels: 0 = insoluble, 0.5 = partial, 1 = soluble. Partial is treated as positive with weight 0.5.")
-
-# Build base table
-df = df_raw[[col_delta_d, col_delta_p, col_delta_h, col_solub] + ([col_group] if use_group else [])].copy()
-df.columns = ["delta_d", "delta_p", "delta_h", "solubility"] + (["group"] if use_group else [])
-
-df[["delta_d","delta_p","delta_h","solubility"]] = df[["delta_d","delta_p","delta_h","solubility"]].apply(pd.to_numeric, errors="coerce")
-df = df.dropna(subset=["delta_d","delta_p","delta_h","solubility"]).drop_duplicates().reset_index(drop=True)
-
-y_raw = df["solubility"].astype(float).values
-y = (y_raw >= 0.5).astype(int)
-w = np.where(y_raw == 0.5, 0.5, 1.0).astype(float)
-df["solubility"] = y
-
-st.write(f"Samples: **{len(df)}** | Positives(bin): **{int(y.sum())}** | Negatives: **{int(len(df)-y.sum())}** | Partials(0.5): **{int((y_raw==0.5).sum())}**")
-if use_group:
-    groups = df["group"].astype(str).values
-    st.write(f"CV scheme: **LOGO** | groups: **{len(np.unique(groups))}**")
-else:
-    groups = None
-    st.write("CV scheme: **LOO** (no group selected)")
-
-
-# =========================
-# Methods (paper-ready)
-# =========================
-st.header("3) Methods (paper-ready text)")
-
-cv_label = "LOGO" if use_group else "LOO"
-
-with st.expander("Open methods text"):
-    st.markdown(f"""
-**Numerical Optimization (RED=1 sphere)**  
-A solubility sphere was obtained via numerical optimization by minimizing a **weighted log-loss**
-objective derived from the Hansen-like distance (Ra) and radius (R0). Distances were converted to
-RED (= Ra/R0) and mapped to probabilities using a logistic transformation with **K = {K_PROB:.3g}**.
-
-**Machine Learning (calibrated probabilities)**  
-Supervised classifiers were trained using (δd, δp, δh). Predicted probabilities were calibrated
-(isotonic if N ≥ {CALIBRATION_MIN_N_ISO}, otherwise sigmoid).  
-
-**ML shell-sphere extraction**  
-A geometric sphere was fitted to grid points lying in an isoprobability **shell**:
-p ∈ [iso, iso+Δ], with Δ = {SHELL_DELTA:.3g}. If insufficient shell points are available, the method
-relaxes Δ upward and iso downward.
-
-**Validation**  
-Cross-validation uses **{cv_label}**. Partial labels (0.5) are treated as positive (y=1) with weight 0.5.
-""")
-
-
-# =========================
-# Run analysis
-# =========================
-if not run_button:
-    st.info("Adjust settings if needed, then click **Run analysis** in the sidebar.")
-    st.stop()
-
-st.header("4) Results")
-
-# Data for ML
-X = df[["delta_d","delta_p","delta_h"]].values
-
-# 4.1 Numerical optimization (global on full data)
-with st.spinner("Running numerical optimization (global fit)…"):
-    pars_best, best_obj = fit_numerical_optimization(df, w, BOUNDS_DEFAULT)
-
-dp, pp, hp, R0 = map(float, pars_best)
-st.subheader("4.1 Numerical Optimization (global)")
-st.write(f"Center: δd={dp:.4f} {UNIT} | δp={pp:.4f} {UNIT} | δh={hp:.4f} {UNIT}")
-st.write(f"Radius: R0={R0:.4f} {UNIT}")
-st.write(f"Objective (weighted logloss + reg): {best_obj:.6f}")
-
-RED_all = red_values(df, pars_best)
-p_numopt_in = prob_from_red(RED_all, k=K_PROB)
-
-# 4.2 ML (in-sample calibrated)
-p0_in = float(np.clip(np.average(y, weights=w), 1e-12, 1-1e-12))
-base_models = make_base_models(42, base_score=p0_in)
-
-proba_ml_in: Dict[str, np.ndarray] = {}
-fitted_ml_in = {}
-
-with st.spinner("Training calibrated ML models (in-sample)…"):
-    for name, est in base_models.items():
+    # (B)/(C) ML shell-spheres + overlay
+    for iso in ISO_LEVELS:
         try:
-            fitted = calibrate_model(est, X, y, w)
-            fitted_ml_in[name] = fitted
-            if hasattr(fitted, "predict_proba"):
-                proba_ml_in[name] = fitted.predict_proba(X)[:, 1]
-        except Exception:
-            pass
+            c_ml, r_ml, npts, iso_used, delta_used = ml_shell_sphere_from_grid(
+                df_filtered, model_for_3d, iso=iso, pad=GRID_PAD, n=GRID_N,
+                shell_delta=SHELL_DELTA, min_points=120
+            )
+            xs_ml, ys_ml, zs_ml = sphere_mesh(c_ml, r_ml)
 
-st.subheader("4.2 ML (in-sample calibrated)")
-st.write(f"Trained models: **{', '.join(list(proba_ml_in.keys()))}**")
+            ml_spheres_table_rows.append({
+                "ML_model": best_ml_name,
+                "iso_target": float(iso),
+                "iso_used": float(iso_used),
+                "shell_delta_used": float(delta_used),
+                "center_delta_d": float(c_ml[0]),
+                "center_delta_p": float(c_ml[1]),
+                "center_delta_h": float(c_ml[2]),
+                "R_ml": float(r_ml),
+                "unit": UNIT,
+                "n_grid_points_shell": int(npts),
+                "GRID_PAD": float(GRID_PAD),
+                "GRID_N": int(GRID_N)
+            })
 
-# choose best ML by AUC_PR in-sample (simple)
-best_ml_name = None
-best_ml_score = -np.inf
-if len(np.unique(y)) == 2 and len(proba_ml_in) > 0:
-    for name, p in proba_ml_in.items():
-        score = average_precision_score(y, p)
-        if score > best_ml_score:
-            best_ml_score = score
-            best_ml_name = name
-else:
-    best_ml_name = list(proba_ml_in.keys())[0] if len(proba_ml_in) else "XGBoost"
+            # (B) ML alone
+            fig_ml = go.Figure()
+            fig_ml.add_trace(go.Surface(
+                x=xs_ml, y=ys_ml, z=zs_ml,
+                name=f"{best_ml_name} shell-sphere (p≈{iso:.2f})",
+                legendgroup="ml",
+                **_surface_style(ML_COLOR, opacity=0.18)
+            ))
+            fig_ml.add_trace(go.Scatter3d(
+                x=df_filtered["delta_d"], y=df_filtered["delta_p"], z=df_filtered["delta_h"],
+                mode="markers", marker=_points_style(colors),
+                text=labels, name="Samples", legendgroup="pts"
+            ))
+            extra = f" | shell Δ={delta_used:.2f}" if delta_used > 0 else " | fallback: volume p≥iso"
+            fig_ml.update_layout(**_pretty_layout(
+                title=f"3D (B) — ML shell-sphere p≈{iso:.2f} | {best_ml_name} | R≈{r_ml:.3f} {UNIT}{extra}"
+            ))
+            fig_ml.update_layout(scene=_pretty_scene())
+            fig_ml.show()
 
-st.write(f"Best ML (in-sample by PR-AUC): **{best_ml_name}**")
+            # (C) Overlay with distinct tones
+            fig_ov = go.Figure()
+            fig_ov.add_trace(go.Surface(
+                x=xs_h, y=ys_h, z=zs_h,
+                name="Numerical Optimization (RED=1)",
+                legendgroup="opti",
+                **_surface_style(OPTI_COLOR, opacity=0.12)
+            ))
+            fig_ov.add_trace(go.Surface(
+                x=xs_ml, y=ys_ml, z=zs_ml,
+                name=f"ML shell-sphere (p≈{iso:.2f}) — {best_ml_name}",
+                legendgroup="ml",
+                **_surface_style(ML_COLOR, opacity=0.12)
+            ))
+            fig_ov.add_trace(go.Scatter3d(
+                x=df_filtered["delta_d"], y=df_filtered["delta_p"], z=df_filtered["delta_h"],
+                mode="markers", marker=_points_style(colors),
+                text=labels, name="Samples", legendgroup="pts"
+            ))
+            fig_ov.update_layout(**_pretty_layout(
+                title=f"3D (C) — Overlay: Numerical Optimization (RED=1) vs ML shell-sphere (p≈{iso:.2f}) | {best_ml_name}"
+            ))
+            fig_ov.update_layout(scene=_pretty_scene())
+            fig_ov.show()
 
-# 4.3 Cross-validation: LOGO or LOO
-if use_group:
-    splitter = LeaveOneGroupOut()
-    splits = list(splitter.split(X, y, groups=groups))
-else:
-    splitter = LeaveOneOut()
-    splits = list(splitter.split(X, y))
+        except Exception as e:
+            print(f"[ML-SHELL-SPHERE][WARN] Failed at iso={iso:.2f}: {e}")
+            print("  Suggestion: increase GRID_N (e.g., 32) and/or GRID_PAD (e.g., 2.0), or reduce ISO_LEVELS.")
 
-p_numopt_cv = np.zeros(len(y), dtype=float)
-p_ml_cv = {name: np.zeros(len(y), dtype=float) for name in base_models.keys()}
+df_ml_spheres = pd.DataFrame(ml_spheres_table_rows) if len(ml_spheres_table_rows) else pd.DataFrame()
 
-with st.spinner(f"Running {cv_label} cross-validation (this can take a while)…"):
-    for (tr_idx, te_idx) in splits:
-        df_tr = df.iloc[tr_idx].reset_index(drop=True)
-        df_te = df.iloc[te_idx].reset_index(drop=True)
-        w_tr = w[tr_idx]
-        y_tr = df_tr["solubility"].values.astype(int)
+# ======================
+# Export Excel
+# ======================
+def round_df_numeric(df_in, ndigits=6):
+    df_out = df_in.copy()
+    for c in df_out.columns:
+        if pd.api.types.is_numeric_dtype(df_out[c]):
+            df_out[c] = df_out[c].round(ndigits)
+    return df_out
 
-        # Numerical optimization inside fold (train only)
-        try:
-            pars_fold, _ = fit_numerical_optimization(df_tr, w_tr, BOUNDS_DEFAULT)
-        except Exception:
-            pars_fold = pars_best
-
-        RED_te = red_values(df_te, pars_fold)
-        p_numopt_cv[te_idx] = prob_from_red(RED_te, k=K_PROB)
-
-        # ML inside fold (train only)
-        X_tr = df_tr[["delta_d","delta_p","delta_h"]].values
-        X_te = df_te[["delta_d","delta_p","delta_h"]].values
-
-        if len(np.unique(y_tr)) < 2:
-            prev = float(np.clip(np.average(y, weights=w), 1e-12, 1-1e-12))
-            for name in base_models.keys():
-                p_ml_cv[name][te_idx] = prev
-            continue
-
-        p0_fold = float(np.clip(np.average(y_tr, weights=w_tr), 1e-12, 1-1e-12))
-        fold_models = make_base_models(42, base_score=p0_fold)
-
-        for name, est in fold_models.items():
-            try:
-                fitted = calibrate_model(est, X_tr, y_tr, w_tr)
-                if hasattr(fitted, "predict_proba"):
-                    p_ml_cv[name][te_idx] = fitted.predict_proba(X_te)[:, 1]
-                else:
-                    p_ml_cv[name][te_idx] = p0_fold
-            except Exception:
-                p_ml_cv[name][te_idx] = p0_fold
-
-st.subheader(f"4.3 Metrics ({cv_label})")
-
-# Build metric tables (unweighted + weighted)
-rows_unw = []
-rows_w = []
-
-rows_unw.append(compute_metrics_row(f"NumericalOpt_IN (unweighted)", y, p_numopt_in, thr=0.5, sample_weight=None))
-rows_w.append(compute_metrics_row(f"NumericalOpt_IN (weighted)", y, p_numopt_in, thr=0.5, sample_weight=w))
-
-rows_unw.append(compute_metrics_row(f"NumericalOpt_{cv_label} (unweighted)", y, p_numopt_cv, thr=0.5, sample_weight=None))
-rows_w.append(compute_metrics_row(f"NumericalOpt_{cv_label} (weighted)", y, p_numopt_cv, thr=0.5, sample_weight=w))
-
+out = df_filtered.copy()
+out['y_raw'] = y_raw
+out['w'] = w
+out['RED'] = RED_all
+out['p_numopt_in'] = p_numopt_in
+out['p_numopt_CV'] = p_numopt_cv
 for name, p in proba_ml_in.items():
-    rows_unw.append(compute_metrics_row(f"{name}_IN (unweighted)", y, p, thr=0.5, sample_weight=None))
-    rows_w.append(compute_metrics_row(f"{name}_IN (weighted)", y, p, thr=0.5, sample_weight=w))
-
+    out[f'proba_{name}_in'] = p
 for name, p in p_ml_cv.items():
-    rows_unw.append(compute_metrics_row(f"{name}_{cv_label} (unweighted)", y, p, thr=0.5, sample_weight=None))
-    rows_w.append(compute_metrics_row(f"{name}_{cv_label} (weighted)", y, p, thr=0.5, sample_weight=w))
+    out[f'proba_{name}_{cv_label}'] = p
 
-df_metrics_unw = pd.DataFrame(rows_unw).sort_values(by=["AUC_PR","AUC_ROC","MCC"], ascending=[False, False, False]).reset_index(drop=True)
-df_metrics_w = pd.DataFrame(rows_w).sort_values(by=["AUC_PR","AUC_ROC","MCC"], ascending=[False, False, False]).reset_index(drop=True)
+out = round_df_numeric(out, ndigits=8)
 
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("**Unweighted metrics**")
-    st.dataframe(df_metrics_unw, use_container_width=True)
-with c2:
-    st.markdown("**Weighted metrics (partial=0.5 weight)**")
-    st.dataframe(df_metrics_w, use_container_width=True)
+df_params_numopt = pd.DataFrame({
+    "Parameter": ["DF_best", "optimizer_best",
+                  "delta_d_center", "delta_p_center", "delta_h_center", "R0", "unit",
+                  "CV_scheme", "group_col"],
+    "Value": [best_df_name, best_optimizer, dp, pp, hp, R0, UNIT,
+              cv_label, (group_col if use_group else "None")]
+})
 
+df_final_settings = pd.DataFrame([
+    {"Group":"NumOpt_prob", "Item":"K_PROB", "Value": K_PROB},
+    {"Group":"NumOpt_prob", "Item":"REG_R0", "Value": REG_R0},
+    {"Group":"CV", "Item":"scheme", "Value": cv_label},
+    {"Group":"CV", "Item":"group_col", "Value": (group_col if use_group else "None")},
+    {"Group":"3D_settings", "Item":"GRID_PAD", "Value": GRID_PAD},
+    {"Group":"3D_settings", "Item":"GRID_N", "Value": GRID_N},
+    {"Group":"3D_settings", "Item":"ISO_LEVELS", "Value": str(ISO_LEVELS)},
+    {"Group":"3D_settings", "Item":"SHELL_DELTA", "Value": SHELL_DELTA},
+    {"Group":"ML_visual", "Item":"best_ml_name_for_3d", "Value": str(best_ml_name)},
+    {"Group":"Calib", "Item":"min_n_isotonic", "Value": CALIBRATION_MIN_N_ISO},
+])
 
-# =========================
-# ROC plots (paper-friendly)
-# =========================
-st.subheader("4.4 ROC curves")
-
-def roc_plot(y_true, curves: Dict[str, np.ndarray], title: str):
-    fig = go.Figure()
-    if len(np.unique(y_true)) != 2:
-        st.warning("ROC requires both classes.")
-        return None
-    for name, p in curves.items():
-        fpr, tpr, _ = roc_curve(y_true, p)
-        aucv = roc_auc_score(y_true, p)
-        fig.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"{name} (AUC={aucv:.2f})"))
-    fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Random", line=dict(dash="dash")))
-    fig.update_layout(
-        title=title,
-        xaxis_title="False Positive Rate (FPR)",
-        yaxis_title="True Positive Rate (TPR)",
-        width=950, height=520,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01)
-    )
-    return fig
-
-curves_in = {"Numerical Optimization": p_numopt_in}
-curves_cv = {f"Numerical Optimization ({cv_label})": p_numopt_cv}
-
-for name, p in proba_ml_in.items():
-    curves_in[f"{name} (cal)"] = p
-for name, p in p_ml_cv.items():
-    curves_cv[f"{name} ({cv_label}, cal)"] = p
-
-fig_roc_in = roc_plot(y, curves_in, "ROC — In-sample")
-fig_roc_cv = roc_plot(y, curves_cv, f"ROC — {cv_label}")
-
-r1, r2 = st.columns(2)
-with r1:
-    if fig_roc_in is not None:
-        st.plotly_chart(fig_roc_in, use_container_width=True)
-with r2:
-    if fig_roc_cv is not None:
-        st.plotly_chart(fig_roc_cv, use_container_width=True)
-
-
-# =========================
-# 3D Figures
-# =========================
-st.subheader("4.5 3D figures (article-style)")
-
-OPTI_COLOR = "rgb(60,110,220)"   # Numerical Optimization
-ML_COLOR   = "rgb(140,80,200)"   # ML
-
-colors_pts, labels_pts = point_colors_from_yraw(y_raw)
-
-# Model for 3D: pick best_ml_name, train on all data and calibrate
-p0_all = float(np.clip(np.average(y, weights=w), 1e-12, 1-1e-12))
-full_base = make_base_models(42, base_score=p0_all)
-if best_ml_name not in full_base:
-    best_ml_name = "XGBoost"
-model_for_3d = calibrate_model(full_base[best_ml_name], X, y, w)
-
-# (A) Numerical Optimization sphere
-xs_h, ys_h, zs_h = sphere_mesh((dp, pp, hp), R0)
-figA = go.Figure()
-figA.add_trace(go.Surface(
-    x=xs_h, y=ys_h, z=zs_h,
-    opacity=0.18,
-    name="Numerical Optimization (RED=1)",
-    legendgroup="opti",
-    **surface_style(OPTI_COLOR)
-))
-figA.add_trace(go.Scatter3d(
-    x=df["delta_d"], y=df["delta_p"], z=df["delta_h"],
-    mode="markers",
-    marker=points_style(colors_pts),
-    text=labels_pts,
-    name="Samples",
-    legendgroup="pts"
-))
-figA.update_layout(
-    title="3D (A) — Numerical Optimization sphere (RED=1)",
-    scene=pretty_scene(UNIT),
-    width=1100, height=820,
-    margin=dict(l=10, r=10, t=70, b=10),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01)
-)
-
-st.plotly_chart(figA, use_container_width=True)
-
-ml_rows = []
-figs_BC = []
-
-for iso in ISO_LEVELS:
-    try:
-        c_ml, r_ml, npts, iso_used, delta_used = ml_shell_sphere_from_grid(
-            df, model_for_3d, iso=float(iso),
-            pad=float(GRID_PAD), n=int(GRID_N),
-            shell_delta=float(SHELL_DELTA), min_points=120
-        )
-
-        xs_ml, ys_ml, zs_ml = sphere_mesh(c_ml, r_ml)
-
-        ml_rows.append(dict(
-            ML_model=str(best_ml_name),
-            iso_target=float(iso),
-            iso_used=float(iso_used),
-            shell_delta_used=float(delta_used),
-            center_delta_d=float(c_ml[0]),
-            center_delta_p=float(c_ml[1]),
-            center_delta_h=float(c_ml[2]),
-            R_ml=float(r_ml),
-            n_grid_points_shell=int(npts),
-            GRID_PAD=float(GRID_PAD),
-            GRID_N=int(GRID_N),
-            unit=str(UNIT)
-        ))
-
-        extra = f" | shell Δ={delta_used:.2f}" if delta_used > 0 else " | fallback: volume p≥iso"
-
-        # (B) ML only
-        figB = go.Figure()
-        figB.add_trace(go.Surface(
-            x=xs_ml, y=ys_ml, z=zs_ml,
-            opacity=0.18,
-            name=f"{best_ml_name} shell-sphere (p≈{iso:.2f})",
-            legendgroup="ml",
-            **surface_style(ML_COLOR)
-        ))
-        figB.add_trace(go.Scatter3d(
-            x=df["delta_d"], y=df["delta_p"], z=df["delta_h"],
-            mode="markers", marker=points_style(colors_pts),
-            text=labels_pts, name="Samples", legendgroup="pts"
-        ))
-        figB.update_layout(
-            title=f"3D (B) — ML shell-sphere p≈{iso:.2f}{extra}",
-            scene=pretty_scene(UNIT),
-            width=1100, height=820,
-            margin=dict(l=10, r=10, t=70, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01)
-        )
-
-        # (C) Overlay
-        figC = go.Figure()
-        figC.add_trace(go.Surface(
-            x=xs_h, y=ys_h, z=zs_h,
-            opacity=0.12,
-            name="Numerical Optimization (RED=1)",
-            legendgroup="opti",
-            **surface_style(OPTI_COLOR)
-        ))
-        figC.add_trace(go.Surface(
-            x=xs_ml, y=ys_ml, z=zs_ml,
-            opacity=0.12,
-            name=f"ML shell-sphere (p≈{iso:.2f}) — {best_ml_name}",
-            legendgroup="ml",
-            **surface_style(ML_COLOR)
-        ))
-        figC.add_trace(go.Scatter3d(
-            x=df["delta_d"], y=df["delta_p"], z=df["delta_h"],
-            mode="markers", marker=points_style(colors_pts),
-            text=labels_pts, name="Samples", legendgroup="pts"
-        ))
-        figC.update_layout(
-            title=f"3D (C) — Overlay: Numerical Optimization vs ML (p≈{iso:.2f})",
-            scene=pretty_scene(UNIT),
-            width=1100, height=820,
-            margin=dict(l=10, r=10, t=70, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01)
-        )
-
-        st.plotly_chart(figB, use_container_width=True)
-        st.plotly_chart(figC, use_container_width=True)
-
-        figs_BC.append((iso, figB, figC))
-
-    except Exception as e:
-        st.warning(f"ML shell-sphere failed at iso={iso}: {e}")
-
-df_ml_spheres = pd.DataFrame(ml_rows)
-
-if not df_ml_spheres.empty:
-    st.markdown("**ML shell-sphere parameters**")
-    st.dataframe(df_ml_spheres, use_container_width=True)
-
-
-# =========================
-# Downloads: Excel + HTML plots (ZIP)
-# =========================
-st.header("5) Downloads")
-
-# Build per-sample output
-out = df.copy()
-out["y_raw"] = y_raw
-out["w"] = w
-out["RED"] = RED_all
-out["p_numopt_in"] = p_numopt_in
-out[f"p_numopt_{cv_label}"] = p_numopt_cv
-for name, p in proba_ml_in.items():
-    out[f"proba_{name}_in"] = p
-for name, p in p_ml_cv.items():
-    out[f"proba_{name}_{cv_label}"] = p
-
-params_tbl = pd.DataFrame([{
-    "center_delta_d": dp,
-    "center_delta_p": pp,
-    "center_delta_h": hp,
-    "R0": R0,
-    "unit": UNIT,
-    "K_PROB": K_PROB,
-    "REG_R0": REG_R0,
-    "CV_scheme": cv_label,
-    "group_col": (col_group if use_group else "None"),
-    "best_ml_for_3d": best_ml_name,
-    "ISO_LEVELS": str(ISO_LEVELS),
-    "GRID_PAD": GRID_PAD,
-    "GRID_N": GRID_N,
-    "SHELL_DELTA": SHELL_DELTA
-}])
-
-# Excel in memory
-excel_bytes = io.BytesIO()
-with pd.ExcelWriter(excel_bytes, engine="openpyxl") as writer:
-    df.to_excel(writer, index=False, sheet_name="Base_bin")
+output_path = "/content/result_full_paper_LOGO_cal_shell.xlsx"
+with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    df_filtered.to_excel(writer, index=False, sheet_name="Base_bin")
     out.to_excel(writer, index=False, sheet_name="Results_per_sample")
-    df_metrics_unw.to_excel(writer, index=False, sheet_name="Metrics_unweighted")
-    df_metrics_w.to_excel(writer, index=False, sheet_name="Metrics_weighted")
-    params_tbl.to_excel(writer, index=False, sheet_name="Final_Params")
+
+    round_df_numeric(df_all_runs, 8).to_excel(writer, index=False, sheet_name="NumOpt_AllRuns")
+    df_params_numopt.to_excel(writer, index=False, sheet_name="NumOpt_Final")
+
+    df_metrics_in_unw.to_excel(writer, index=False, sheet_name="Metrics_IN_unweighted")
+    df_metrics_in_w.to_excel(writer, index=False, sheet_name="Metrics_IN_weighted")
+    df_metrics_cv_unw.to_excel(writer, index=False, sheet_name=f"Metrics_{cv_label}_unweighted")
+    df_metrics_cv_w.to_excel(writer, index=False, sheet_name=f"Metrics_{cv_label}_weighted")
+
     if not df_ml_spheres.empty:
         df_ml_spheres.to_excel(writer, index=False, sheet_name="ML_ShellSpheres")
-excel_bytes.seek(0)
+    df_final_settings.to_excel(writer, index=False, sheet_name="Final_Settings")
 
-st.download_button(
-    "Download results Excel",
-    data=excel_bytes.getvalue(),
-    file_name=f"results_numopt_vs_ml_{cv_label}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-
-# ZIP with HTML plots
-zip_buf = io.BytesIO()
-with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    z.writestr("fig_3D_A_numopt.html", figA.to_html(full_html=True, include_plotlyjs="cdn"))
-    if fig_roc_in is not None:
-        z.writestr("fig_ROC_in_sample.html", fig_roc_in.to_html(full_html=True, include_plotlyjs="cdn"))
-    if fig_roc_cv is not None:
-        z.writestr(f"fig_ROC_{cv_label}.html", fig_roc_cv.to_html(full_html=True, include_plotlyjs="cdn"))
-    for iso, figB, figC in figs_BC:
-        z.writestr(f"fig_3D_B_ml_iso_{iso}.html", figB.to_html(full_html=True, include_plotlyjs="cdn"))
-        z.writestr(f"fig_3D_C_overlay_iso_{iso}.html", figC.to_html(full_html=True, include_plotlyjs="cdn"))
-zip_buf.seek(0)
-
-st.download_button(
-    "Download figures (HTML) as ZIP",
-    data=zip_buf.getvalue(),
-    file_name="figures_html.zip",
-    mime="application/zip"
-)
+time.sleep(1.0)
+files.download(output_path)
+print(f"\n📦 Excel saved and downloaded: {output_path}")
