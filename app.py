@@ -1,53 +1,65 @@
 # ============================================================
-# BLOCO 1/4 — TOTAL (CORE + TABS + DATA LOADING/PREPROCESS)
-#  ✅ Define tudo que os Blocos 2/3/4 precisam existir:
-#   - st.set_page_config + tab1..tab4
-#   - UNIT em st.session_state
-#   - Upload de Excel, escolha de sheet/colunas (UI)
-#   - df_filtered com colunas padronizadas: delta_d, delta_p, delta_h, solubility (+group opcional)
-#   - y_raw, y_bin, w, use_group, groups
-#   - Funções core: hansen_distance, prob_from_red, red_values
-#   - DFs: df_geom, df_logloss, df_brier, df_hinge, df_softcount
-#   - z_to_x, fit_by_methods
+# APP.PY — PARTE 1/4 (COMPLETA)
+#  ✅ Agora com 6 ABAS:
+#   tab1 Data
+#   tab2 Numerical Optimization (+ 3D rápido do NumOpt)
+#   tab3 ML (in-sample)
+#   tab4 Cross-Validation (LOGO/LOO)
+#   tab5 3D (NumOpt + ML + overlay)
+#   tab6 Export
 #
-#  Observação:
-#   - Mantém o termo "Numerical Optimization" (não Hansen no título do app)
+#  ✅ Parte 1/4 inclui:
+#   - imports + config + tabs
+#   - session_state defaults
+#   - carga de Excel + mapeamento de colunas (Tab 1)
+#   - core numérico (Hansen distance, RED->p)
+#   - objective functions + fit_by_methods()
+#
+#  ⚠️ Importante:
+#   - Mantém "Numerical Optimization" (não Hansen no título do app)
+#   - Corrige imports faltantes (roc_auc_score, average_precision_score)
 # ============================================================
 
 import warnings
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from scipy.optimize import minimize, differential_evolution, dual_annealing, shgo
 
+from sklearn.metrics import roc_auc_score, average_precision_score
+
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
 # -----------------------------
-# Streamlit config + TABS
+# Streamlit config + 6 TABS
 # -----------------------------
 st.set_page_config(page_title="Numerical Optimization vs ML — Solubility", layout="wide")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1) Data",
     "2) Numerical Optimization",
-    "3) Cross-Validation",
-    "4) 3D + Export"
+    "3) ML (in-sample)",
+    "4) Cross-Validation",
+    "5) 3D",
+    "6) Export"
 ])
 
 # -----------------------------
 # Global settings (shared)
 # -----------------------------
-if "UNIT" not in st.session_state:
-    st.session_state["UNIT"] = "MPa\u00b9\u2044\u00b2"  # MPa½
-
-# Defaults used later (can be overwritten by UI in other blocks)
+st.session_state.setdefault("UNIT", "MPa\u00b9\u2044\u00b2")  # MPa½
 st.session_state.setdefault("K_PROB", 6.0)
 st.session_state.setdefault("REG_R0", 0.05)
 st.session_state.setdefault("NMS_RESTARTS", 1)
 st.session_state.setdefault("COBYLA_RESTARTS", 1)
 st.session_state.setdefault("speed_profile", "full")  # "full" or "fast"
+
+# app metadata (export)
+st.session_state.setdefault("app_version", "v6tabs_paper")
+st.session_state.setdefault("run_timestamp", pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
 
 # -----------------------------
 # Optional GA
@@ -67,7 +79,9 @@ BOUNDS = [(10, 25), (0, 25), (0, 25), (2, 25)]
 # CORE FUNCTIONS (Numerical Optimization)
 # ============================================================
 def hansen_distance(d_d, d_p, d_h, dp, pp, hp):
-    d_d = np.asarray(d_d, float); d_p = np.asarray(d_p, float); d_h = np.asarray(d_h, float)
+    d_d = np.asarray(d_d, float)
+    d_p = np.asarray(d_p, float)
+    d_h = np.asarray(d_h, float)
     return np.sqrt(4*(d_d - dp)**2 + (d_p - pp)**2 + (d_h - hp)**2)
 
 def prob_from_red(RED, k=6.0):
@@ -384,7 +398,7 @@ def fit_by_methods(
 # ============================================================
 with tab1:
     st.title("Numerical Optimization vs ML — Solubility")
-    st.caption("Upload an Excel file, select the sheet and columns, then proceed to the tabs.")
+    st.caption("Upload an Excel file, select the sheet and columns, then proceed to the other tabs.")
 
     st.markdown("### Upload Excel")
     up = st.file_uploader("Upload .xlsx", type=["xlsx"])
@@ -396,6 +410,8 @@ with tab1:
     xls = pd.ExcelFile(up)
     sheet_name = st.selectbox("Sheet", xls.sheet_names, index=0)
     df = xls.parse(sheet_name)
+
+    st.session_state["sheet_name"] = sheet_name
 
     st.markdown("### Column mapping")
     cols = list(df.columns)
@@ -412,6 +428,11 @@ with tab1:
 
     use_group = (group_col != "(none)")
 
+    # store mapping (for export metadata)
+    colmap = dict(delta_d=delta_d_col, delta_p=delta_p_col, delta_h=delta_h_col, solubility=solub_col, group=(group_col if use_group else None))
+    st.session_state["colmap"] = colmap
+    st.session_state["group_col"] = (group_col if use_group else "None")
+
     # Build filtered base
     need_cols = [delta_d_col, delta_p_col, delta_h_col, solub_col] + ([group_col] if use_group else [])
     df_filtered = df[need_cols].copy()
@@ -424,7 +445,12 @@ with tab1:
         ["delta_d", "delta_p", "delta_h", "solubility"]
     ].apply(pd.to_numeric, errors="coerce")
 
-    df_filtered = df_filtered.dropna(subset=["delta_d", "delta_p", "delta_h", "solubility"]).drop_duplicates().reset_index(drop=True)
+    df_filtered = (
+        df_filtered
+        .dropna(subset=["delta_d", "delta_p", "delta_h", "solubility"])
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
 
     # Store raw labels + weights
     y_raw = df_filtered["solubility"].astype(float).values
@@ -460,8 +486,7 @@ with tab1:
     st.dataframe(df_filtered.head(50), use_container_width=True)
 
 # ============================================================
-# Make required globals available for Bloco 2/3/4
-# (so you can paste blocks without re-wiring)
+# Make required globals available for other parts
 # ============================================================
 df_filtered = st.session_state.get("df_filtered")
 y_raw = st.session_state.get("y_raw")
@@ -469,28 +494,25 @@ w = st.session_state.get("w")
 use_group = st.session_state.get("use_group", False)
 groups = st.session_state.get("groups", None)
 UNIT = st.session_state.get("UNIT", "MPa\u00b9\u2044\u00b2")
-
 # ============================================================
-#  BLOCO 2/4 — COMPLETO (Numerical Optimization) — FIX UNIT DEFAULT
-#  - Destaque (cards) com δd, δp, δh, R0 + DF/Optimizer no TOPO
-#  - Wrapper robusto para fit_by_methods (evita crash por assinatura diferente)
-#  - Confusion matrix (in-sample) + métricas rápidas
-#  - Mapa 2D colocado MAIS ABAIXO (como você pediu)
+# APP.PY — PARTE 2/4 (TAB 2 COMPLETA)
+#  Aba 2: Numerical Optimization
+#   ✅ roda NumOpt (comparando DFs e solvers)
+#   ✅ mostra cards (δd, δp, δh, R0 + DF/optimizer)
+#   ✅ métricas rápidas + confusion matrix (in-sample)
+#   ✅ 2D map (mais abaixo)
+#   ✅ 3D RÁPIDO DO NUMOPT AQUI (para não precisar ir até o fim)
 #
-#  FIX IMPORTANTE:
-#   - NÃO usa UNIT como default em assinatura de função (evita NameError)
-#   - unit é resolvido via st.session_state.get("UNIT", "MPa½")
-#
-#  REQUISITOS (BLOCO 1/4):
-#   - df_filtered (delta_d, delta_p, delta_h, solubility)
-#   - y_raw, w, use_group, groups
-#   - funções: hansen_distance, red_values, prob_from_red, fit_by_methods
+#  Requisitos (Parte 1/4):
+#   - df_filtered, y_raw, w, use_group, groups
+#   - hansen_distance, red_values, prob_from_red, fit_by_methods
 # ============================================================
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 from sklearn.metrics import roc_curve, roc_auc_score, average_precision_score, confusion_matrix
 
@@ -519,13 +541,9 @@ def plot_confusion_matrix_pretty(cm, title="Confusion Matrix", xlabel="Predicted
     return fig
 
 # -----------------------------
-# 2D map (δd, δp) with δh fixed at center  — NO UNIT DEFAULT
+# 2D map (δd, δp) with δh fixed at center
 # -----------------------------
 def plot_numopt_map(df_local, center, R0, unit=None, bins=36, pad=1.0, k_prob=6.0):
-    """
-    2D map in (δd, δp) plane with δh fixed at optimized center.
-    Colors represent p(RED) = sigmoid(k*(1-RED)).
-    """
     if unit is None:
         unit = st.session_state.get("UNIT", "MPa\u00b9\u2044\u00b2")  # MPa½
 
@@ -564,13 +582,58 @@ def plot_numopt_map(df_local, center, R0, unit=None, bins=36, pad=1.0, k_prob=6.
     return fig
 
 # -----------------------------
-# Robust call to fit_by_methods (handles different signatures)
+# Plotly helpers (NumOpt 3D quick)
+# -----------------------------
+def sphere_mesh(center, r, nu=72, nv=36):
+    cx, cy, cz = map(float, center)
+    r = float(r)
+    u = np.linspace(0, 2*np.pi, int(nu))
+    v = np.linspace(0, np.pi, int(nv))
+    uu, vv = np.meshgrid(u, v, indexing="xy")
+    xs = r*np.cos(uu)*np.sin(vv) + cx
+    ys = r*np.sin(uu)*np.sin(vv) + cy
+    zs = r*np.cos(vv) + cz
+    return xs, ys, zs
+
+def point_colors_from_yraw(y_raw_local):
+    yraw = np.asarray(y_raw_local, float)
+    colors = np.where(yraw == 1.0, "blue", np.where(yraw == 0.5, "orange", "red"))
+    labels = np.where(yraw == 1.0, "soluble", np.where(yraw == 0.5, "partial", "insoluble"))
+    return colors, labels
+
+def _pretty_scene(unit):
+    return dict(
+        xaxis=dict(title=f"δd ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
+        yaxis=dict(title=f"δp ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
+        zaxis=dict(title=f"δh ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
+        aspectmode="data",
+        camera=dict(eye=dict(x=1.35, y=1.25, z=0.95))
+    )
+
+def _surface_style(base_rgb="rgb(60,110,220)", opacity=0.18):
+    return dict(
+        opacity=float(opacity),
+        showscale=False,
+        colorscale=[[0.0, base_rgb], [1.0, base_rgb]],
+        lighting=dict(ambient=0.55, diffuse=0.85, specular=0.25, roughness=0.55, fresnel=0.08),
+        lightposition=dict(x=100, y=200, z=100)
+    )
+
+def _points_style(colors):
+    return dict(
+        size=5,
+        color=colors,
+        opacity=0.95,
+        line=dict(width=0.6, color="rgba(0,0,0,0.35)")
+    )
+
+# -----------------------------
+# Robust call to fit_by_methods
 # -----------------------------
 def _call_fit_by_methods(df_local, weights_local, df_name, nms_restarts=1, cobyla_restarts=1):
-    """
-    Tries "new" signature (with K_PROB/REG_R0/speed_profile),
-    then falls back to the original signature.
-    """
     try:
         return fit_by_methods(
             df_local=df_local,
@@ -592,18 +655,19 @@ def _call_fit_by_methods(df_local, weights_local, df_name, nms_restarts=1, cobyl
         )
 
 # ============================================================
-# TAB 2 — Numerical Optimization
+# TAB 2 — Numerical Optimization (+ 3D quick)
 # ============================================================
 with tab2:
     st.subheader("Numerical Optimization — Sphere Fit (Solubility Parameters)")
 
-    # Guarantee UNIT available for labels (not required, but convenient)
-    if "UNIT" not in st.session_state:
-        st.session_state["UNIT"] = "MPa\u00b9\u2044\u00b2"
-    UNIT_LOCAL = st.session_state["UNIT"]
+    if df_filtered is None or len(df_filtered) == 0:
+        st.info("Go to Tab 1 and load data first.")
+        st.stop()
+
+    UNIT_LOCAL = st.session_state.get("UNIT", "MPa\u00b9\u2044\u00b2")
 
     # Controls
-    c1, c2, c3 = st.columns([1.1, 1.1, 1.1])
+    c1, c2, c3, c4 = st.columns([1.05, 1.05, 1.05, 1.2])
     with c1:
         RUN_NUMOPT = st.checkbox("Run Numerical Optimization", value=True)
         RUN_CM = st.checkbox("Confusion matrix (in-sample)", value=True)
@@ -621,7 +685,12 @@ with tab2:
             step=0.01
         )
     with c3:
+        speed_profile = st.radio("Speed profile", ["fast", "full"], index=1,
+                                 help="fast is recommended for quick iteration; full for final runs.")
+        st.session_state["speed_profile"] = str(speed_profile)
         show_map = st.checkbox("Show 2D map (placed below)", value=True)
+    with c4:
+        show_3d_quick = st.checkbox("Show 3D (NumOpt sphere) here", value=True)
         map_bins = st.slider("Map resolution (bins)", min_value=20, max_value=80, value=36, step=2)
 
     st.session_state["K_PROB"] = float(K_PROB)
@@ -634,7 +703,7 @@ with tab2:
     y = df_filtered["solubility"].values.astype(int)
     w_local = np.asarray(w, float)
 
-    # Objective list (>=5)
+    # Objective list
     DF_LIST_TO_COMPARE = ["DF_GEOM", "DF_LOGLOSS", "DF_BRIER", "DF_HINGE", "DF_SOFTCOUNT"]
 
     NMS_RESTARTS = int(st.session_state.get("NMS_RESTARTS", 1))
@@ -663,7 +732,7 @@ with tab2:
                 if best_overall is None:
                     best_overall = row0
                 else:
-                    # Paper criterion: prioritize DF_LOGLOSS + DF_GEOM + AUPRC
+                    # Paper criterion
                     key_new = (
                         float(row0.get("DF_LOGLOSS", np.inf)),
                         float(row0.get("DF_GEOM", np.inf)),
@@ -678,7 +747,7 @@ with tab2:
                         best_overall = row0
 
             if best_overall is None:
-                st.error("No Numerical Optimization results. Check your data/columns and BLOCO 1 functions.")
+                st.error("No Numerical Optimization results. Check your data/columns.")
                 st.stop()
 
             df_all_runs = pd.concat(all_runs, ignore_index=True) if len(all_runs) else pd.DataFrame()
@@ -696,7 +765,7 @@ with tab2:
     hp = float(best_overall["delta_h"])
     R0 = float(best_overall["R0"])
 
-    # ✅ HIGHLIGHT at top
+    # ✅ Highlight
     st.markdown("### ⭐ Solubility Parameters — Optimized by Numerical Optimization")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("δd (center)", f"{dp:.4f} {UNIT_LOCAL}")
@@ -709,9 +778,7 @@ with tab2:
     mm2.metric("Optimizer", best_optimizer)
     mm3.metric("CV scheme", "LOGO" if use_group else "LOO")
 
-    st.caption("Optimized solubility parameters obtained by Numerical Optimization (sphere fit, probabilized via RED→p).")
-
-    # Save session state for next tabs + export
+    # Save for other tabs
     st.session_state["numopt_done"] = True
     st.session_state["best_df_name"] = best_df_name
     st.session_state["best_optimizer"] = best_optimizer
@@ -739,7 +806,7 @@ with tab2:
     st.session_state["thr_numopt_in"] = float(thr_numopt_in)
 
     # Quick in-sample summary
-    cA, cB, cC = st.columns([1.2, 1.0, 1.0])
+    cA, cB, cC = st.columns([1.25, 1.0, 1.0])
     with cA:
         st.markdown("#### In-sample summary (Numerical Optimization)")
         if len(np.unique(y)) == 2:
@@ -753,7 +820,7 @@ with tab2:
         st.metric("Partial (0.5)", f"{int(np.sum(np.asarray(y_raw, float)==0.5))}")
         st.metric("N total", f"{int(len(y))}")
 
-    # Confusion matrix plot
+    # Confusion matrix
     if RUN_CM:
         fig_cm = plot_confusion_matrix_pretty(
             cm_numopt_in,
@@ -763,11 +830,44 @@ with tab2:
         )
         st.pyplot(fig_cm, clear_figure=True)
 
-    # All runs table
+    # ✅ 3D QUICK NUMOPT HERE
+    if show_3d_quick:
+        st.markdown("---")
+        st.markdown("## 3D (Quick) — Numerical Optimization sphere (RED=1)")
+        st.caption("This is the NumOpt sphere only (fast preview). Full ML+overlay is in Tab 5.")
+
+        colors, labels = point_colors_from_yraw(y_raw)
+        xs_h, ys_h, zs_h = sphere_mesh((dp, pp, hp), R0)
+
+        fig3d = go.Figure()
+        fig3d.add_trace(go.Surface(
+            x=xs_h, y=ys_h, z=zs_h,
+            name="Numerical Optimization (RED=1)",
+            legendgroup="opti",
+            **_surface_style("rgb(60,110,220)", opacity=0.18)
+        ))
+        fig3d.add_trace(go.Scatter3d(
+            x=df_filtered["delta_d"], y=df_filtered["delta_p"], z=df_filtered["delta_h"],
+            mode="markers",
+            marker=_points_style(colors),
+            text=labels,
+            name="Samples",
+            legendgroup="pts"
+        ))
+        fig3d.update_layout(
+            title=f"NumOpt sphere (RED=1) | DF={best_df_name} | Optimizer={best_optimizer}",
+            width=1100, height=780,
+            margin=dict(l=10, r=10, t=70, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01)
+        )
+        fig3d.update_layout(scene=_pretty_scene(UNIT_LOCAL))
+        st.plotly_chart(fig3d, use_container_width=True)
+
+    # All runs
     with st.expander("Numerical Optimization — all runs (ranked)"):
         st.dataframe(df_all_runs, use_container_width=True)
 
-    # ✅ MAPA MAIS ABAIXO
+    # 2D map placed below
     if show_map:
         st.markdown("---")
         st.markdown("## 2D Map (placed below) — Numerical Optimization")
@@ -782,21 +882,22 @@ with tab2:
             k_prob=float(K_PROB)
         )
         st.pyplot(fig_map, clear_figure=True)
-
 # ============================================================
-#  APP.PY — PARTE 3/4 (VERSÃO COMPLETA + CORRIGIDA)
+# APP.PY — PARTE 3/4 (TAB 3 + TAB 4)
 #  Aba 3: ML (Calibrated) — in-sample
-#  Aba 4: Cross-Validation (LOGO/LOO) — Out-of-fold probabilities
+#  Aba 4: Cross-Validation (LOGO/LOO) — out-of-fold probabilities
 #
-#  Correções principais:
-#   ✅ CV state inicializado (evita "No CV cached yet" eterno sem diagnóstico)
-#   ✅ try/except em CV com st.exception + "Last CV error"
-#   ✅ Default NumOpt em CV: FAST (global params only) para não travar
-#   ✅ Opção de limitar folds (debug) + escolher modelos no CV
-#   ✅ Plots top-N por AUPRC (IN e CV) para não poluir
+#  ✅ CV robusto:
+#   - inicializa estado (evita "No CV cached yet" sem diagnóstico)
+#   - try/except com st.exception + last error
+#   - modo NumOpt em CV: Fast (global params) ou Paper (refit por fold)
+#   - limite de folds (debug) para não travar Streamlit Cloud
+#   - seleção de modelos em CV
 #
-#  Requisitos: Parte 1/4 e 2/4 acima (df_filtered, y_raw, w, use_group, groups,
-#            + funções: red_values, prob_from_red, fit_by_methods, UNIT, etc.)
+#  Requisitos (Partes 1/4 e 2/4):
+#   - df_filtered, y_raw, w, use_group, groups
+#   - st.session_state["numopt_done"], dp, pp, hp, R0, p_numopt_in, thr_numopt_in
+#   - funç: make_base_models/calibrate_model serão definidas AQUI (e usadas na Parte 4/4)
 # ============================================================
 
 import numpy as np
@@ -827,15 +928,16 @@ def plot_roc_pretty(y_true, curves, title="ROC Curve", subtitle=None):
         return None
     fig = plt.figure(figsize=(6.6, 5.2), dpi=160)
     from sklearn.metrics import roc_curve, auc
+    ax = fig.gca()
     for c in curves:
         fpr, tpr, _ = roc_curve(y_true, c["p"])
-        fig.gca().plot(fpr, tpr, label=f'{c["label"]} (AUC={auc(fpr,tpr):.2f})', lw=c.get("lw", 1.6))
-    fig.gca().plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
-    fig.gca().set_xlabel("False Positive Rate")
-    fig.gca().set_ylabel("True Positive Rate")
-    fig.gca().set_title(f"{title}\n{subtitle}" if subtitle else title)
-    fig.gca().legend()
-    _article_axes(fig.gca())
+        ax.plot(fpr, tpr, label=f'{c["label"]} (AUC={auc(fpr,tpr):.2f})', lw=c.get("lw", 1.6))
+    ax.plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(f"{title}\n{subtitle}" if subtitle else title)
+    ax.legend()
+    _article_axes(ax)
     fig.tight_layout()
     return fig
 
@@ -844,15 +946,16 @@ def plot_pr_pretty(y_true, curves, title="Precision–Recall Curve", subtitle=No
         return None
     fig = plt.figure(figsize=(6.6, 5.2), dpi=160)
     from sklearn.metrics import precision_recall_curve, average_precision_score
+    ax = fig.gca()
     for c in curves:
         prec, rec, _ = precision_recall_curve(y_true, c["p"])
         ap = average_precision_score(y_true, c["p"])
-        fig.gca().plot(rec, prec, label=f'{c["label"]} (AP={ap:.2f})', lw=c.get("lw", 1.6))
-    fig.gca().set_xlabel("Recall")
-    fig.gca().set_ylabel("Precision")
-    fig.gca().set_title(f"{title}\n{subtitle}" if subtitle else title)
-    fig.gca().legend()
-    _article_axes(fig.gca())
+        ax.plot(rec, prec, label=f'{c["label"]} (AP={ap:.2f})', lw=c.get("lw", 1.6))
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(f"{title}\n{subtitle}" if subtitle else title)
+    ax.legend()
+    _article_axes(ax)
     fig.tight_layout()
     return fig
 
@@ -860,20 +963,22 @@ def plot_calibration_pretty(y_true, probas_dict, title="Calibration (Reliability
     if len(np.unique(y_true)) < 2:
         return None
     fig = plt.figure(figsize=(6.6, 5.2), dpi=160)
+    ax = fig.gca()
     for label, p in probas_dict.items():
         frac_pos, mean_pred = calibration_curve(y_true, p, n_bins=n_bins, strategy="quantile")
-        fig.gca().plot(mean_pred, frac_pos, marker="o", lw=1.4, label=label)
-    fig.gca().plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
-    fig.gca().set_xlabel("Mean Predicted Probability")
-    fig.gca().set_ylabel("Fraction of Positives")
-    fig.gca().set_title(f"{title}\n{subtitle}" if subtitle else title)
-    fig.gca().legend()
-    _article_axes(fig.gca())
+        ax.plot(mean_pred, frac_pos, marker="o", lw=1.4, label=label)
+    ax.plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
+    ax.set_xlabel("Mean Predicted Probability")
+    ax.set_ylabel("Fraction of Positives")
+    ax.set_title(f"{title}\n{subtitle}" if subtitle else title)
+    ax.legend()
+    _article_axes(ax)
     fig.tight_layout()
     return fig
 
 # ------------------------------------------------------------
 # ML builders + calibration
+#  (usadas também na PARTE 4/4)
 # ------------------------------------------------------------
 CALIBRATION_METHOD_HIGHN = "isotonic"
 CALIBRATION_METHOD_LOWN  = "sigmoid"
@@ -903,6 +1008,7 @@ def calibrate_model(base_estimator, X_tr, y_tr, w_tr, min_n_iso=60):
             cal.fit(X_tr, y_tr)
         return cal
     except Exception:
+        # fallback: uncalibrated fit
         try:
             base_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
         except Exception:
@@ -910,7 +1016,7 @@ def calibrate_model(base_estimator, X_tr, y_tr, w_tr, min_n_iso=60):
         return base_estimator
 
 # ------------------------------------------------------------
-# Metrics helpers (iguais ao seu script)
+# Metrics helpers (weighted + unweighted)
 # ------------------------------------------------------------
 def _safe_div(a, b):
     return float(a) / float(b) if float(b) != 0 else np.nan
@@ -1030,7 +1136,8 @@ def build_metrics_tables(y, w, p_in, thr_in, p_cv, thr_cv,
 # ------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def run_ml_in_cached(X_csv: str, y_tuple: tuple, w_tuple: tuple, min_n_iso: int, chosen_models: tuple):
-    X = pd.read_csv(pd.io.common.StringIO(X_csv)).values
+    import io
+    X = pd.read_csv(io.StringIO(X_csv)).values
     y = np.asarray(y_tuple, int)
     w = np.asarray(w_tuple, float)
 
@@ -1059,7 +1166,10 @@ with tab3:
     X = df_filtered[["delta_d","delta_p","delta_h"]].values
     w_local = np.asarray(w, float)
 
-    p_numopt_in = st.session_state["p_numopt_in"]
+    p_numopt_in = st.session_state.get("p_numopt_in", None)
+    if p_numopt_in is None:
+        st.info("Numerical Optimization probabilities not found. Run Tab 2 again.")
+        st.stop()
 
     c1, c2, c3 = st.columns([1.0, 1.0, 1.2])
     with c1:
@@ -1067,11 +1177,18 @@ with tab3:
         RUN_PR = st.checkbox("PR plot", value=True)
         RUN_CAL = st.checkbox("Calibration plot", value=True)
     with c2:
-        min_n_iso = st.number_input("Min N for isotonic", min_value=20, max_value=300,
-                                    value=int(st.session_state.get("CALIB_MIN_N_ISO", 60)), step=5)
+        min_n_iso = st.number_input(
+            "Min N for isotonic",
+            min_value=20, max_value=300,
+            value=int(st.session_state.get("CALIB_MIN_N_ISO", 60)),
+            step=5
+        )
     with c3:
-        keep_models = st.multiselect("Models", ["XGBoost","RandomForest","SVM-RBF"],
-                                     default=["XGBoost","RandomForest","SVM-RBF"])
+        keep_models = st.multiselect(
+            "Models",
+            ["XGBoost","RandomForest","SVM-RBF"],
+            default=["XGBoost","RandomForest","SVM-RBF"]
+        )
         topN = st.number_input("Top-N ML lines in plots", min_value=1, max_value=5, value=2, step=1)
 
     run_ml_btn = st.button("▶ Train + Calibrate ML (in-sample)", type="primary", use_container_width=True)
@@ -1099,7 +1216,7 @@ with tab3:
         st.info("No ML cached yet. Click the button above.")
         st.stop()
 
-    # Rank by AUPRC (display only)
+    # rank by AUPRC (display only)
     ranked = []
     if len(np.unique(y)) == 2:
         for name, p in proba_ml_in.items():
@@ -1139,15 +1256,11 @@ with tab3:
 with tab4:
     st.subheader("Cross-Validation (LOGO/LOO) — Out-of-fold probabilities")
 
-    # --- Ensure CV state keys exist (diagnostics) ---
-    if "p_numopt_cv" not in st.session_state:
-        st.session_state["p_numopt_cv"] = None
-    if "p_ml_cv" not in st.session_state:
-        st.session_state["p_ml_cv"] = None
-    if "cv_label" not in st.session_state:
-        st.session_state["cv_label"] = None
-    if "cv_last_error" not in st.session_state:
-        st.session_state["cv_last_error"] = ""
+    # ensure state keys exist
+    st.session_state.setdefault("p_numopt_cv", None)
+    st.session_state.setdefault("p_ml_cv", None)
+    st.session_state.setdefault("cv_label", None)
+    st.session_state.setdefault("cv_last_error", "")
 
     if not st.session_state.get("numopt_done", False):
         st.info("Run Tab 2 first.")
@@ -1170,7 +1283,6 @@ with tab4:
     REG_R0 = float(st.session_state.get("REG_R0", 0.05))
     min_n_iso = int(st.session_state.get("CALIB_MIN_N_ISO", 60))
 
-    # Available ML models to run in CV
     proba_ml_in = st.session_state.get("proba_ml_in", {})
     model_names = list(proba_ml_in.keys())
     if len(model_names) == 0:
@@ -1191,8 +1303,11 @@ with tab4:
         if cv_mode == "Paper (refit per fold)":
             st.warning("Paper mode is slow: it refits Numerical Optimization per fold.")
     with c3:
-        max_folds = st.number_input("Max folds (debug)", min_value=5, max_value=5000, value=200, step=25,
-                                    help="Limits folds for quick tests. Increase for full CV.")
+        max_folds = st.number_input(
+            "Max folds (debug)",
+            min_value=5, max_value=5000, value=200, step=25,
+            help="Limits folds for quick tests. Increase for full CV."
+        )
         cv_models = st.multiselect(
             "Models to run in CV",
             options=model_names,
@@ -1245,7 +1360,6 @@ with tab4:
                     if cv_mode == "Fast (global params only)":
                         pars_cv = np.array([dp, pp, hp, R0], float)
                     else:
-                        # paper: refit per fold (still using fast settings)
                         runs_cv = fit_by_methods(
                             df_local=df_tr,
                             weights_local=w_tr,
@@ -1269,7 +1383,7 @@ with tab4:
                     X_tr = df_tr[["delta_d","delta_p","delta_h"]].values
                     X_te = df_te[["delta_d","delta_p","delta_h"]].values
 
-                    # guard single-class fold
+                    # guard: single-class fold
                     if len(np.unique(y_tr)) < 2:
                         prev = float(np.clip(np.average(y, weights=w_local), 1e-12, 1-1e-12))
                         for name in cv_models:
@@ -1290,7 +1404,7 @@ with tab4:
                         else:
                             p_ml_cv[name][te_idx] = p0_fold
 
-            # ✅ Save state ONLY after success
+            # cache only after success
             st.session_state["p_numopt_cv"] = p_numopt_cv
             st.session_state["p_ml_cv"] = p_ml_cv
             st.session_state["cv_label"] = cv_label
@@ -1302,7 +1416,7 @@ with tab4:
 
             st.success(f"{cv_label} CV done and cached. (folds used: {len(splits)})")
 
-            # ---- Metrics + best ML by CV ranking ----
+            # metrics tables
             df_metrics_in_unw, df_metrics_in_w, df_metrics_cv_unw, df_metrics_cv_w = build_metrics_tables(
                 y=y, w=w_local,
                 p_in=st.session_state["p_numopt_in"], thr_in=float(st.session_state["thr_numopt_in"]),
@@ -1318,13 +1432,17 @@ with tab4:
             st.session_state["df_metrics_cv_unw"] = df_metrics_cv_unw
             st.session_state["df_metrics_cv_w"] = df_metrics_cv_w
 
+            # best ML name (by CV table ordering)
             ml_only = df_metrics_cv_unw[
                 df_metrics_cv_unw["Model"].str.contains(f"_{cv_label}") &
                 (~df_metrics_cv_unw["Model"].str.startswith("NumericalOptimization"))
             ]
             if not ml_only.empty:
                 best_ml_row = ml_only.iloc[0].to_dict()
-                best_ml_name = best_ml_row["Model"].replace(f"_{cv_label} (unweighted)", "").replace(f"_{cv_label} (weighted)", "").replace(f"_{cv_label}", "")
+                best_ml_name = best_ml_row["Model"]
+                best_ml_name = best_ml_name.replace(f"_{cv_label} (unweighted)", "")
+                best_ml_name = best_ml_name.replace(f"_{cv_label} (weighted)", "")
+                best_ml_name = best_ml_name.replace(f"_{cv_label}", "")
             else:
                 best_ml_name = cv_models[0] if len(cv_models) else model_names[0]
 
@@ -1352,7 +1470,7 @@ with tab4:
     st.write(f"NumOpt in CV mode: **{st.session_state.get('cv_mode_numopt','')}**")
     st.write(f"CV models: {st.session_state.get('cv_models', [])} | Max folds used: {st.session_state.get('max_folds', '')}")
 
-    # Rank ML for CV plots by CV AUPRC
+    # rank for CV plots by AUPRC
     ranked_cv = []
     if len(np.unique(y)) == 2:
         for name, p in p_ml_cv.items():
@@ -1397,21 +1515,23 @@ with tab4:
 
     st.markdown("### Metrics IN — weighted")
     st.dataframe(df_metrics_in_w, use_container_width=True)
-
-# Fim da PARTE 3/4 (completa + corrigida)
-
 # ============================================================
-#  APP.PY — PARTE 4/4 (COM DESTAQUES)
-#  Aba 5: 3D Plotly — esfera NumOpt (RED=1) + esfera ML (shell p≈iso) + overlay
-#  Aba 6: Export Excel — base + resultados por amostra + métricas + configs + metadados
+# APP.PY — PARTE 4/4 (TAB 5 + TAB 6) — AJUSTADO PARA 6 ABAS
+#  Tab 5: 3D Plotly — NumOpt sphere (RED=1) + ML shell-sphere (p≈iso) + overlay
+#  Tab 6: Export Excel — base + resultados por amostra + métricas + configs + metadados
 #
-#  ✅ Destaques adicionados:
-#   - TOP Aba 5: parâmetros otimizados (δd, δp, δh, R0) em métricas
-#   - Aba 5: resumo “best ML shell-sphere” (centro ML + R_ml) em métricas
-#   - TOP Aba 6: bloco final NumOpt vs Best ML (CV) + métricas chave (se CV existir)
+#  ✅ Correções/importantes (para "3D export" funcionar):
+#   - NÃO usa "with tab5/tab6" se essas variáveis não existirem:
+#       -> assume que PARTE 1/4 criou: tab1..tab6 = st.tabs([...])
+#   - NÃO usa UNIT como default em assinatura
+#   - _pretty_scene() busca unit via st.session_state
+#   - Export inclui df_ml_spheres (se existir) e métricas (se CV rodou)
 #
-#  Requisitos: Partes 1/4–3/4 acima (df_filtered, y_raw, w, use_group, groups,
-#  + funções: make_base_models, calibrate_model, red_values, prob_from_red, fit_by_methods etc.)
+#  Requisitos (Partes 1/4–3/4):
+#   - df_filtered, y_raw, w, use_group, groups, UNIT (ou st.session_state["UNIT"])
+#   - st.session_state["numopt_done"], dp, pp, hp, R0, best_df_name, best_optimizer
+#   - funç: red_values, prob_from_red (NumOpt)
+#   - funç: make_base_models, calibrate_model (definidas na Parte 3/4)
 # ============================================================
 
 import numpy as np
@@ -1423,6 +1543,9 @@ import io
 # -----------------------------
 # 3D helpers
 # -----------------------------
+def _get_unit():
+    return st.session_state.get("UNIT", "MPa\u00b9\u2044\u00b2")  # MPa½
+
 def point_colors_from_yraw(y_raw):
     yraw = np.asarray(y_raw, float)
     colors = np.where(yraw == 1.0, "blue", np.where(yraw == 0.5, "orange", "red"))
@@ -1433,7 +1556,7 @@ def fit_sphere_least_squares(P):
     P = np.asarray(P, float)
     if P.shape[0] < 10:
         raise ValueError("Too few points to fit a sphere (>=10).")
-    x, y_, z = P[:,0], P[:,1], P[:,2]
+    x, y_, z = P[:, 0], P[:, 1], P[:, 2]
     A = np.c_[2*x, 2*y_, 2*z, np.ones_like(x)]
     b = x**2 + y_**2 + z**2
     beta, *_ = np.linalg.lstsq(A, b, rcond=None)
@@ -1454,8 +1577,8 @@ def sphere_mesh(center, r, nu=80, nv=40):
     return xs, ys, zs
 
 def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_delta=0.05, min_points=120):
-    mn = df_local[["delta_d","delta_p","delta_h"]].min().values.astype(float) - float(pad)
-    mx = df_local[["delta_d","delta_p","delta_h"]].max().values.astype(float) + float(pad)
+    mn = df_local[["delta_d", "delta_p", "delta_h"]].min().values.astype(float) - float(pad)
+    mx = df_local[["delta_d", "delta_p", "delta_h"]].max().values.astype(float) + float(pad)
 
     xd = np.linspace(mn[0], mx[0], int(n))
     xp = np.linspace(mn[1], mx[1], int(n))
@@ -1463,6 +1586,8 @@ def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_del
     Xd, Xp, Xh = np.meshgrid(xd, xp, xh, indexing="ij")
     pts = np.c_[Xd.ravel(), Xp.ravel(), Xh.ravel()]
 
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("Model has no predict_proba(). Ensure calibration returns a proba-capable estimator.")
     p = np.clip(model.predict_proba(pts)[:, 1], 1e-12, 1-1e-12)
 
     iso_use = float(iso)
@@ -1471,13 +1596,14 @@ def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_del
     for _ in range(6):
         mask = (p >= iso_use) & (p <= min(1.0, iso_use + delta))
         Psel = pts[mask]
-        if Psel.shape[0] >= min_points:
+        if Psel.shape[0] >= int(min_points):
             center, r = fit_sphere_least_squares(Psel)
             return center, r, int(Psel.shape[0]), iso_use, delta
 
         delta = min(0.20, delta + 0.03)
         iso_use = max(0.05, iso_use - 0.03)
 
+    # fallback: volume p >= iso
     mask = (p >= float(iso))
     Psel = pts[mask]
     if Psel.shape[0] < 10:
@@ -1488,17 +1614,25 @@ def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_del
 # -----------------------------
 # Plotly style (distinct tones)
 # -----------------------------
-OPTI_COLOR = "rgb(60,110,220)"   # Numerical Optimization (blue)
+OPTI_COLOR = "rgb(60,110,220)"   # NumOpt (blue)
 ML_COLOR   = "rgb(140,80,200)"   # ML (purple)
 
-def _pretty_scene(unit=UNIT):
+def _pretty_scene(unit=None):
+    if unit is None:
+        unit = _get_unit()
     return dict(
-        xaxis=dict(title=f"δd ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
-                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
-        yaxis=dict(title=f"δp ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
-                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
-        zaxis=dict(title=f"δh ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
-                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
+        xaxis=dict(
+            title=f"δd ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+            gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"
+        ),
+        yaxis=dict(
+            title=f"δp ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+            gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"
+        ),
+        zaxis=dict(
+            title=f"δh ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+            gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"
+        ),
         aspectmode="data",
         camera=dict(eye=dict(x=1.35, y=1.25, z=0.95))
     )
@@ -1520,9 +1654,9 @@ def _pretty_layout(title):
 
 def _surface_style(base_rgb, opacity=0.16):
     return dict(
-        opacity=opacity,
+        opacity=float(opacity),
         showscale=False,
-        colorscale=[[0.0, base_rgb],[1.0, base_rgb]],
+        colorscale=[[0.0, base_rgb], [1.0, base_rgb]],
         lighting=dict(ambient=0.55, diffuse=0.85, specular=0.25, roughness=0.55, fresnel=0.08),
         lightposition=dict(x=100, y=200, z=100)
     )
@@ -1545,6 +1679,8 @@ with tab5:
         st.info("Run Tab 2 first (Numerical Optimization).")
         st.stop()
 
+    unit = _get_unit()
+
     dp = float(st.session_state["dp"])
     pp = float(st.session_state["pp"])
     hp = float(st.session_state["hp"])
@@ -1552,18 +1688,19 @@ with tab5:
     best_df_name = st.session_state.get("best_df_name", "")
     best_optimizer = st.session_state.get("best_optimizer", "")
 
-    # ✅ HIGHLIGHT — NumOpt solubility parameters
+    # highlight NumOpt
     st.markdown("### ⭐ Solubility Parameters — Numerical Optimization (Optimized)")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("δd (center)", f"{dp:.4f} {UNIT}")
-    m2.metric("δp (center)", f"{pp:.4f} {UNIT}")
-    m3.metric("δh (center)", f"{hp:.4f} {UNIT}")
-    m4.metric("R0 (radius)", f"{R0:.4f} {UNIT}")
+    m1.metric("δd (center)", f"{dp:.4f} {unit}")
+    m2.metric("δp (center)", f"{pp:.4f} {unit}")
+    m3.metric("δh (center)", f"{hp:.4f} {unit}")
+    m4.metric("R0 (radius)", f"{R0:.4f} {unit}")
     mm1, mm2, mm3 = st.columns([1.4, 1.2, 1.4])
     mm1.metric("Best DF", str(best_df_name))
     mm2.metric("Optimizer", str(best_optimizer))
     mm3.metric("CV scheme", "LOGO" if use_group else "LOO")
 
+    # controls
     c1, c2, c3 = st.columns([1.1, 1.0, 1.0])
     with c1:
         RUN_3D = st.checkbox("Enable 3D plots", value=True)
@@ -1572,14 +1709,14 @@ with tab5:
         ISO_LEVELS = st.multiselect(
             "ISO_LEVELS (p≈iso)",
             options=[0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90],
-            default=[0.50,0.80]
+            default=[0.50, 0.80]
         )
         if len(ISO_LEVELS) == 0:
             ISO_LEVELS = [0.50]
     with c3:
-        GRID_PAD = st.slider("GRID_PAD", 0.5, 3.0, float(1.5), 0.1)
-        GRID_N = st.slider("GRID_N", 18, 42, int(28), 1)
-        SHELL_DELTA = st.slider("SHELL_DELTA", 0.01, 0.20, float(0.05), 0.01)
+        GRID_PAD = st.slider("GRID_PAD", 0.5, 3.0, float(st.session_state.get("GRID_PAD", 1.5)), 0.1)
+        GRID_N = st.slider("GRID_N", 18, 42, int(st.session_state.get("GRID_N", 28)), 1)
+        SHELL_DELTA = st.slider("SHELL_DELTA", 0.01, 0.20, float(st.session_state.get("SHELL_DELTA", 0.05)), 0.01)
 
     # store configs for export
     st.session_state["GRID_PAD"] = float(GRID_PAD)
@@ -1590,11 +1727,21 @@ with tab5:
     if not RUN_3D:
         st.stop()
 
-    # Build calibrated ML model for 3D using all data
-    best_ml_name = st.session_state.get("best_ml_name", "XGBoost")
+    # need ML builders from Tab 3
+    if ("proba_ml_in" not in st.session_state) and ("best_ml_name" not in st.session_state):
+        st.info("Run Tab 3 (ML in-sample) or Tab 4 (CV) to define ML model for 3D.")
+        st.stop()
 
+    best_ml_name = st.session_state.get("best_ml_name", None)
+    if best_ml_name is None:
+        # fallback: first cached ML model
+        proba_ml_in = st.session_state.get("proba_ml_in", {})
+        best_ml_name = list(proba_ml_in.keys())[0] if len(proba_ml_in) else "XGBoost"
+        st.session_state["best_ml_name"] = best_ml_name
+
+    # build calibrated ML model for 3D using all data
     y_bin = df_filtered["solubility"].values.astype(int)
-    X = df_filtered[["delta_d","delta_p","delta_h"]].values
+    X_all = df_filtered[["delta_d","delta_p","delta_h"]].values
     w_local = np.asarray(w, float)
     min_n_iso = int(st.session_state.get("CALIB_MIN_N_ISO", 60))
 
@@ -1603,7 +1750,9 @@ with tab5:
     if best_ml_name not in full_base:
         st.warning(f"3D: Model '{best_ml_name}' not available; using XGBoost.")
         best_ml_name = "XGBoost"
-    model_for_3d = calibrate_model(full_base[best_ml_name], X, y_bin, w_local, min_n_iso=min_n_iso)
+        st.session_state["best_ml_name"] = best_ml_name
+
+    model_for_3d = calibrate_model(full_base[best_ml_name], X_all, y_bin, w_local, min_n_iso=min_n_iso)
 
     colors, labels = point_colors_from_yraw(y_raw)
 
@@ -1625,12 +1774,12 @@ with tab5:
     fig_h.update_layout(**_pretty_layout(
         title=f"3D (A) — Numerical Optimization sphere (RED=1) | DF={best_df_name} | Optimizer={best_optimizer}"
     ))
-    fig_h.update_layout(scene=_pretty_scene())
+    fig_h.update_layout(scene=_pretty_scene(unit=unit))
     st.plotly_chart(fig_h, use_container_width=True)
 
     ml_spheres_rows = []
 
-    # (B)/(C) ML spheres
+    # (B)/(C) ML spheres per iso
     for iso in ISO_LEVELS:
         try:
             c_ml, r_ml, npts, iso_used, delta_used = ml_shell_sphere_from_grid(
@@ -1641,7 +1790,7 @@ with tab5:
             xs_ml, ys_ml, zs_ml = sphere_mesh(c_ml, r_ml)
 
             ml_spheres_rows.append({
-                "ML_model": best_ml_name,
+                "ML_model": str(best_ml_name),
                 "iso_target": float(iso),
                 "iso_used": float(iso_used),
                 "shell_delta_used": float(delta_used),
@@ -1649,7 +1798,7 @@ with tab5:
                 "center_delta_p": float(c_ml[1]),
                 "center_delta_h": float(c_ml[2]),
                 "R_ml": float(r_ml),
-                "unit": UNIT,
+                "unit": str(unit),
                 "n_grid_points_shell": int(npts),
                 "GRID_PAD": float(GRID_PAD),
                 "GRID_N": int(GRID_N)
@@ -1671,9 +1820,9 @@ with tab5:
                 ))
             extra = f" | shell Δ={delta_used:.2f}" if delta_used > 0 else " | fallback: volume p≥iso"
             fig_ml.update_layout(**_pretty_layout(
-                title=f"3D (B) — ML shell-sphere p≈{iso:.2f} | {best_ml_name} | R≈{r_ml:.3f} {UNIT}{extra}"
+                title=f"3D (B) — ML shell-sphere p≈{iso:.2f} | {best_ml_name} | R≈{r_ml:.3f} {unit}{extra}"
             ))
-            fig_ml.update_layout(scene=_pretty_scene())
+            fig_ml.update_layout(scene=_pretty_scene(unit=unit))
             st.plotly_chart(fig_ml, use_container_width=True)
 
             # (C) Overlay
@@ -1697,9 +1846,9 @@ with tab5:
                     text=labels, name="Samples", legendgroup="pts"
                 ))
             fig_ov.update_layout(**_pretty_layout(
-                title=f"3D (C) — Overlay: Numerical Optimization (RED=1) vs ML shell-sphere (p≈{iso:.2f}) | {best_ml_name}"
+                title=f"3D (C) — Overlay: NumOpt (RED=1) vs ML shell-sphere (p≈{iso:.2f}) | {best_ml_name}"
             ))
-            fig_ov.update_layout(scene=_pretty_scene())
+            fig_ov.update_layout(scene=_pretty_scene(unit=unit))
             st.plotly_chart(fig_ov, use_container_width=True)
 
         except Exception as e:
@@ -1709,7 +1858,7 @@ with tab5:
     df_ml_spheres = pd.DataFrame(ml_spheres_rows)
     st.session_state["df_ml_spheres"] = df_ml_spheres
 
-    # ✅ HIGHLIGHT — ML shell-sphere best summary (stable = max points)
+    # ML highlight (most stable = max grid points)
     if not df_ml_spheres.empty:
         st.markdown("### ⭐ ML Shell-Sphere — Fitted Parameters (Highlight)")
         df2 = df_ml_spheres.copy()
@@ -1719,13 +1868,13 @@ with tab5:
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("ML model", str(best_row.get("ML_model","")))
         s2.metric("iso (used)", f"{float(best_row.get('iso_used', np.nan)):.2f}")
-        s3.metric("R_ml", f"{float(best_row.get('R_ml', np.nan)):.4f} {UNIT}")
+        s3.metric("R_ml", f"{float(best_row.get('R_ml', np.nan)):.4f} {unit}")
         s4.metric("grid points", f"{int(best_row.get('n_grid_points_shell', 0))}")
 
         t1, t2, t3 = st.columns(3)
-        t1.metric("δd_ml (center)", f"{float(best_row.get('center_delta_d', np.nan)):.4f} {UNIT}")
-        t2.metric("δp_ml (center)", f"{float(best_row.get('center_delta_p', np.nan)):.4f} {UNIT}")
-        t3.metric("δh_ml (center)", f"{float(best_row.get('center_delta_h', np.nan)):.4f} {UNIT}")
+        t1.metric("δd_ml (center)", f"{float(best_row.get('center_delta_d', np.nan)):.4f} {unit}")
+        t2.metric("δp_ml (center)", f"{float(best_row.get('center_delta_p', np.nan)):.4f} {unit}")
+        t3.metric("δh_ml (center)", f"{float(best_row.get('center_delta_h', np.nan)):.4f} {unit}")
 
         with st.expander("ML shell-sphere full table"):
             st.dataframe(df_ml_spheres, use_container_width=True)
@@ -1740,14 +1889,15 @@ with tab6:
         st.info("Run Tab 2 first.")
         st.stop()
 
-    # Gather what exists
+    unit = _get_unit()
+
+    # gather NumOpt
     dp = float(st.session_state["dp"])
     pp = float(st.session_state["pp"])
     hp = float(st.session_state["hp"])
     R0 = float(st.session_state["R0"])
-
-    best_df_name = st.session_state.get("best_df_name","")
-    best_optimizer = st.session_state.get("best_optimizer","")
+    best_df_name = st.session_state.get("best_df_name", "")
+    best_optimizer = st.session_state.get("best_optimizer", "")
 
     K_PROB = float(st.session_state.get("K_PROB", 6.0))
     REG_R0 = float(st.session_state.get("REG_R0", 0.05))
@@ -1756,6 +1906,7 @@ with tab6:
     RED_all = st.session_state.get("RED_all", None)
     thr_numopt_in = float(st.session_state.get("thr_numopt_in", 0.5))
 
+    # CV
     p_numopt_cv = st.session_state.get("p_numopt_cv", None)
     p_ml_cv = st.session_state.get("p_ml_cv", {})
     cv_label = st.session_state.get("cv_label", "CV")
@@ -1764,25 +1915,28 @@ with tab6:
     thr_numopt_cv = float(st.session_state.get("thr_numopt_cv", 0.5))
     thr_ml = float(st.session_state.get("thr_ml", 0.5))
 
+    # ML in-sample
     proba_ml_in = st.session_state.get("proba_ml_in", {})
+
+    # other tables
     df_all_runs = st.session_state.get("df_all_runs", pd.DataFrame())
     df_ml_spheres = st.session_state.get("df_ml_spheres", pd.DataFrame())
 
-    # Metrics
+    # metrics
     df_metrics_in_unw = st.session_state.get("df_metrics_in_unw", pd.DataFrame())
-    df_metrics_in_w = st.session_state.get("df_metrics_in_w", pd.DataFrame())
+    df_metrics_in_w   = st.session_state.get("df_metrics_in_w", pd.DataFrame())
     df_metrics_cv_unw = st.session_state.get("df_metrics_cv_unw", pd.DataFrame())
-    df_metrics_cv_w = st.session_state.get("df_metrics_cv_w", pd.DataFrame())
+    df_metrics_cv_w   = st.session_state.get("df_metrics_cv_w", pd.DataFrame())
 
-    # ✅ FINAL HIGHLIGHT (paper-ready)
+    # final highlight
     st.markdown("## ✅ Final Highlight — Numerical Optimization vs ML")
     best_ml_name = st.session_state.get("best_ml_name", "")
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### ⭐ Numerical Optimization (optimized)")
-        st.write(f"**Center:** δd={dp:.4f}, δp={pp:.4f}, δh={hp:.4f} ({UNIT})")
-        st.write(f"**Radius:** R0={R0:.4f} ({UNIT})")
+        st.write(f"**Center:** δd={dp:.4f}, δp={pp:.4f}, δh={hp:.4f} ({unit})")
+        st.write(f"**Radius:** R0={R0:.4f} ({unit})")
         st.write(f"**Best DF:** {best_df_name}")
         st.write(f"**Optimizer:** {best_optimizer}")
         st.write(f"**CV scheme:** {cv_label} | **NumOpt CV mode:** {cv_mode}")
@@ -1793,18 +1947,18 @@ with tab6:
             row = df_metrics_cv_unw[df_metrics_cv_unw["Model"].str.contains(f"{best_ml_name}_{cv_label}", regex=False)]
             if not row.empty:
                 r = row.iloc[0].to_dict()
-                st.write(f"**AUC-ROC:** {r.get('AUC_ROC_unweighted', np.nan):.3f}")
-                st.write(f"**AUC-PR:**  {r.get('AUC_PR_unweighted', np.nan):.3f}")
-                st.write(f"**MCC:**     {r.get('MCC', np.nan):.3f}")
-                st.write(f"**LogLoss:**  {r.get('LogLoss', np.nan):.3f}")
+                st.write(f"**AUC-ROC:** {float(r.get('AUC_ROC_unweighted', np.nan)):.3f}")
+                st.write(f"**AUC-PR:**  {float(r.get('AUC_PR_unweighted', np.nan)):.3f}")
+                st.write(f"**MCC:**     {float(r.get('MCC', np.nan)):.3f}")
+                st.write(f"**LogLoss:**  {float(r.get('LogLoss', np.nan)):.3f}")
             else:
                 st.info("Best-ML row not found in CV metrics table.")
         else:
             st.info("Run Tab 4 (CV) to populate Best-ML metrics.")
 
-    # Results_per_sample
+    # results_per_sample
     out = df_filtered.copy()
-    out["y_raw"] = y_raw
+    out["y_raw"] = np.asarray(y_raw, float)
     out["w"] = np.asarray(w, float)
 
     if RED_all is not None:
@@ -1820,7 +1974,7 @@ with tab6:
         for name, p in p_ml_cv.items():
             out[f"proba_{name}_{cv_label}"] = np.asarray(p, float)
 
-    # Params sheet
+    # params sheet
     df_params_numopt = pd.DataFrame({
         "Parameter": [
             "DF_best", "optimizer_best",
@@ -1831,14 +1985,14 @@ with tab6:
         ],
         "Value": [
             best_df_name, best_optimizer,
-            dp, pp, hp, R0, UNIT,
+            dp, pp, hp, R0, unit,
             cv_label, cv_mode,
             thr_numopt_in, thr_numopt_cv, thr_ml,
             best_ml_name
         ]
     })
 
-    # Settings + metadata
+    # metadata
     n_total = int(len(df_filtered))
     n_pos = int(np.sum(df_filtered["solubility"].values.astype(int)))
     n_neg = int(n_total - n_pos)
@@ -1873,13 +2027,16 @@ with tab6:
     if export_btn:
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            # base
             df_filtered.to_excel(writer, index=False, sheet_name="Base_bin")
             out.to_excel(writer, index=False, sheet_name="Results_per_sample")
 
+            # numopt
             if df_all_runs is not None and not df_all_runs.empty:
                 df_all_runs.to_excel(writer, index=False, sheet_name="NumOpt_AllRuns")
             df_params_numopt.to_excel(writer, index=False, sheet_name="NumOpt_Final")
 
+            # metrics
             if df_metrics_in_unw is not None and not df_metrics_in_unw.empty:
                 df_metrics_in_unw.to_excel(writer, index=False, sheet_name="Metrics_IN_unweighted")
             if df_metrics_in_w is not None and not df_metrics_in_w.empty:
@@ -1889,9 +2046,11 @@ with tab6:
             if df_metrics_cv_w is not None and not df_metrics_cv_w.empty:
                 df_metrics_cv_w.to_excel(writer, index=False, sheet_name=f"Metrics_{cv_label}_weighted")
 
+            # ml spheres
             if df_ml_spheres is not None and not df_ml_spheres.empty:
                 df_ml_spheres.to_excel(writer, index=False, sheet_name="ML_ShellSpheres")
 
+            # metadata
             df_meta.to_excel(writer, index=False, sheet_name="Run_Metadata")
 
         bio.seek(0)
@@ -1903,4 +2062,4 @@ with tab6:
             use_container_width=True
         )
 
-# Fim da PARTE 4/4 (com destaques)
+# Fim da PARTE 4/4
