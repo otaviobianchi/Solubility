@@ -1516,48 +1516,63 @@ with tab4:
     st.markdown("### Metrics IN — weighted")
     st.dataframe(df_metrics_in_w, use_container_width=True)
 # ============================================================
-# APP.PY — PARTE 4/4 (TAB 5 + TAB 6) — AJUSTADO PARA 6 ABAS
+# ============================================================
+# APP.PY — PARTE 4/4 (TAB 5 + TAB 6) — COMPLETA (6 ABAS)
 #  Tab 5: 3D Plotly — NumOpt sphere (RED=1) + ML shell-sphere (p≈iso) + overlay
 #  Tab 6: Export Excel — base + resultados por amostra + métricas + configs + metadados
 #
-#  ✅ Correções/importantes (para "3D export" funcionar):
-#   - NÃO usa "with tab5/tab6" se essas variáveis não existirem:
-#       -> assume que PARTE 1/4 criou: tab1..tab6 = st.tabs([...])
-#   - NÃO usa UNIT como default em assinatura
-#   - _pretty_scene() busca unit via st.session_state
-#   - Export inclui df_ml_spheres (se existir) e métricas (se CV rodou)
+#  ✅ Inclui PATCH robusto para ML shell-sphere:
+#     - auto expand GRID_N / GRID_PAD
+#     - relax iso + widen shell band
+#     - fallbacks por volume (p>=iso_target / p>=iso_relaxed)
+#     - retorna meta diagnóstico
 #
-#  Requisitos (Partes 1/4–3/4):
-#   - df_filtered, y_raw, w, use_group, groups, UNIT (ou st.session_state["UNIT"])
-#   - st.session_state["numopt_done"], dp, pp, hp, R0, best_df_name, best_optimizer
-#   - funç: red_values, prob_from_red (NumOpt)
-#   - funç: make_base_models, calibrate_model (definidas na Parte 3/4)
+#  ✅ Mantém:
+#     - tons diferentes para NumOpt vs ML
+#     - export inclui df_ml_spheres, métricas IN/CV e metadados
+#
+#  Requisitos (das Partes 1/4–3/4):
+#   - tab5, tab6 (criados na Parte 1/4: st.tabs([...]))
+#   - df_filtered, y_raw, w, use_group, groups, st.session_state["numopt_done"]
+#   - st.session_state["dp"], ["pp"], ["hp"], ["R0"], ["best_df_name"], ["best_optimizer"]
+#   - (Opcional p/ export): st.session_state["p_numopt_in"], ["RED_all"], ["thr_numopt_in"]
+#   - ML: make_base_models(), calibrate_model() (definidas na Parte 3/4)
 # ============================================================
 
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import io
+
 
 # -----------------------------
-# 3D helpers
+# Small helpers
 # -----------------------------
 def _get_unit():
     return st.session_state.get("UNIT", "MPa\u00b9\u2044\u00b2")  # MPa½
 
-def point_colors_from_yraw(y_raw):
-    yraw = np.asarray(y_raw, float)
+
+def point_colors_from_yraw(y_raw_local):
+    yraw = np.asarray(y_raw_local, float)
     colors = np.where(yraw == 1.0, "blue", np.where(yraw == 0.5, "orange", "red"))
     labels = np.where(yraw == 1.0, "soluble", np.where(yraw == 0.5, "partial", "insoluble"))
     return colors, labels
 
+
+# -----------------------------
+# Sphere fit + mesh
+# -----------------------------
 def fit_sphere_least_squares(P):
+    """
+    Least-squares sphere fit (algebraic). Needs >=10 points for stability.
+    Returns: center (cx,cy,cz), radius r
+    """
     P = np.asarray(P, float)
     if P.shape[0] < 10:
         raise ValueError("Too few points to fit a sphere (>=10).")
     x, y_, z = P[:, 0], P[:, 1], P[:, 2]
-    A = np.c_[2*x, 2*y_, 2*z, np.ones_like(x)]
+    A = np.c_[2 * x, 2 * y_, 2 * z, np.ones_like(x)]
     b = x**2 + y_**2 + z**2
     beta, *_ = np.linalg.lstsq(A, b, rcond=None)
     cx, cy, cz, c0 = beta
@@ -1566,50 +1581,158 @@ def fit_sphere_least_squares(P):
     r = float(np.sqrt(r2))
     return (float(cx), float(cy), float(cz)), r
 
+
 def sphere_mesh(center, r, nu=80, nv=40):
-    cx, cy, cz = center
-    u = np.linspace(0, 2*np.pi, nu)
-    v = np.linspace(0, np.pi, nv)
+    cx, cy, cz = map(float, center)
+    r = float(r)
+    u = np.linspace(0, 2*np.pi, int(nu))
+    v = np.linspace(0, np.pi, int(nv))
     uu, vv = np.meshgrid(u, v, indexing="xy")
     xs = r*np.cos(uu)*np.sin(vv) + cx
     ys = r*np.sin(uu)*np.sin(vv) + cy
     zs = r*np.cos(vv) + cz
     return xs, ys, zs
 
-def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_delta=0.05, min_points=120):
-    mn = df_local[["delta_d", "delta_p", "delta_h"]].min().values.astype(float) - float(pad)
-    mx = df_local[["delta_d", "delta_p", "delta_h"]].max().values.astype(float) + float(pad)
 
-    xd = np.linspace(mn[0], mx[0], int(n))
-    xp = np.linspace(mn[1], mx[1], int(n))
-    xh = np.linspace(mn[2], mx[2], int(n))
-    Xd, Xp, Xh = np.meshgrid(xd, xp, xh, indexing="ij")
-    pts = np.c_[Xd.ravel(), Xp.ravel(), Xh.ravel()]
+# -----------------------------
+# Robust ML shell-sphere extraction (PATCH)
+# -----------------------------
+def ml_shell_sphere_from_grid(
+    df_local,
+    model,
+    iso=0.5,
+    pad=1.5,
+    n=28,
+    shell_delta=0.05,
+    min_points=80,
+    max_tries=10,
+    auto_expand=True
+):
+    """
+    Extract a 'sphere-like' shell from ML probabilities by sampling a 3D grid in (δd,δp,δh).
+    Robust version:
+      - adaptively increases grid density/padding,
+      - relaxes iso and widens shell band,
+      - fallbacks by volume (p >= iso_target; then p >= iso_relaxed).
+    Returns:
+      center, r, npts, iso_used, delta_used, meta(dict)
+    """
+    meta = {}
 
     if not hasattr(model, "predict_proba"):
         raise ValueError("Model has no predict_proba(). Ensure calibration returns a proba-capable estimator.")
-    p = np.clip(model.predict_proba(pts)[:, 1], 1e-12, 1-1e-12)
 
+    base_mn = df_local[["delta_d", "delta_p", "delta_h"]].min().values.astype(float)
+    base_mx = df_local[["delta_d", "delta_p", "delta_h"]].max().values.astype(float)
+
+    iso_target = float(iso)
     iso_use = float(iso)
     delta = float(shell_delta)
 
-    for _ in range(6):
+    n_use = int(n)
+    pad_use = float(pad)
+    last_shell_pts = 0
+
+    def _grid_pts(mn, mx, n_):
+        xd = np.linspace(mn[0], mx[0], int(n_))
+        xp = np.linspace(mn[1], mx[1], int(n_))
+        xh = np.linspace(mn[2], mx[2], int(n_))
+        Xd, Xp, Xh = np.meshgrid(xd, xp, xh, indexing="ij")
+        return np.c_[Xd.ravel(), Xp.ravel(), Xh.ravel()]
+
+    # tries: shell band first
+    for t in range(int(max_tries)):
+        mn = base_mn - pad_use
+        mx = base_mx + pad_use
+
+        pts = _grid_pts(mn, mx, n_use)
+        p = np.clip(model.predict_proba(pts)[:, 1], 1e-12, 1-1e-12)
+
         mask = (p >= iso_use) & (p <= min(1.0, iso_use + delta))
         Psel = pts[mask]
-        if Psel.shape[0] >= int(min_points):
+        npts = int(Psel.shape[0])
+        last_shell_pts = npts
+
+        if npts >= int(min_points):
             center, r = fit_sphere_least_squares(Psel)
-            return center, r, int(Psel.shape[0]), iso_use, delta
+            meta.update(dict(
+                mode="shell",
+                tries=t+1,
+                GRID_N=n_use,
+                GRID_PAD=pad_use,
+                iso_target=iso_target,
+                iso_used=iso_use,
+                shell_delta_used=delta,
+                n_shell=npts,
+                p_min=float(p.min()),
+                p_max=float(p.max()),
+                frac_high=float((p >= iso_use).mean()),
+                last_shell_pts=int(last_shell_pts)
+            ))
+            return center, r, npts, iso_use, delta, meta
 
-        delta = min(0.20, delta + 0.03)
-        iso_use = max(0.05, iso_use - 0.03)
+        # relax band + iso
+        delta = min(0.25, delta + 0.03)
+        iso_use = max(0.30, iso_use - 0.03) if iso_target >= 0.5 else max(0.10, iso_use - 0.02)
 
-    # fallback: volume p >= iso
-    mask = (p >= float(iso))
-    Psel = pts[mask]
-    if Psel.shape[0] < 10:
-        raise ValueError("Not enough grid points. Increase GRID_N/GRID_PAD or reduce iso.")
-    center, r = fit_sphere_least_squares(Psel)
-    return center, r, int(Psel.shape[0]), float(iso), -1.0
+        # expand grid occasionally
+        if auto_expand:
+            if (n_use < 36) and (t % 2 == 1):
+                n_use += 2
+            if (pad_use < 2.6) and (t % 3 == 2):
+                pad_use += 0.2
+
+    # fallback 1: volume p >= iso_target
+    mn = base_mn - pad_use
+    mx = base_mx + pad_use
+    pts = _grid_pts(mn, mx, n_use)
+    p = np.clip(model.predict_proba(pts)[:, 1], 1e-12, 1-1e-12)
+
+    Psel = pts[p >= iso_target]
+    if Psel.shape[0] >= 10:
+        center, r = fit_sphere_least_squares(Psel)
+        meta.update(dict(
+            mode="fallback_volume",
+            tries=int(max_tries),
+            GRID_N=n_use,
+            GRID_PAD=pad_use,
+            iso_target=iso_target,
+            iso_used=iso_target,
+            shell_delta_used=-1.0,
+            n_shell=int(Psel.shape[0]),
+            p_min=float(p.min()),
+            p_max=float(p.max()),
+            frac_high=float((p >= iso_target).mean()),
+            last_shell_pts=int(last_shell_pts)
+        ))
+        return center, r, int(Psel.shape[0]), float(iso_target), -1.0, meta
+
+    # fallback 2: volume p >= iso_use (relaxed)
+    Psel = pts[p >= iso_use]
+    if Psel.shape[0] >= 10:
+        center, r = fit_sphere_least_squares(Psel)
+        meta.update(dict(
+            mode="fallback_volume_relaxed",
+            tries=int(max_tries),
+            GRID_N=n_use,
+            GRID_PAD=pad_use,
+            iso_target=iso_target,
+            iso_used=iso_use,
+            shell_delta_used=-2.0,
+            n_shell=int(Psel.shape[0]),
+            p_min=float(p.min()),
+            p_max=float(p.max()),
+            frac_high=float((p >= iso_use).mean()),
+            last_shell_pts=int(last_shell_pts)
+        ))
+        return center, r, int(Psel.shape[0]), float(iso_use), -2.0, meta
+
+    raise ValueError(
+        "Not enough grid points for shell or volume. "
+        f"Try increasing GRID_N and GRID_PAD or using lower ISO_LEVELS. "
+        f"(last shell pts={last_shell_pts}, GRID_N={n_use}, GRID_PAD={pad_use})"
+    )
+
 
 # -----------------------------
 # Plotly style (distinct tones)
@@ -1617,25 +1740,21 @@ def ml_shell_sphere_from_grid(df_local, model, iso=0.5, pad=1.5, n=28, shell_del
 OPTI_COLOR = "rgb(60,110,220)"   # NumOpt (blue)
 ML_COLOR   = "rgb(140,80,200)"   # ML (purple)
 
+
 def _pretty_scene(unit=None):
     if unit is None:
         unit = _get_unit()
     return dict(
-        xaxis=dict(
-            title=f"δd ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
-            gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"
-        ),
-        yaxis=dict(
-            title=f"δp ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
-            gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"
-        ),
-        zaxis=dict(
-            title=f"δh ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
-            gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"
-        ),
+        xaxis=dict(title=f"δd ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
+        yaxis=dict(title=f"δp ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
+        zaxis=dict(title=f"δh ({unit})", showbackground=True, backgroundcolor="rgba(245,245,245,1)",
+                   gridcolor="rgba(180,180,180,0.35)", zerolinecolor="rgba(120,120,120,0.25)"),
         aspectmode="data",
         camera=dict(eye=dict(x=1.35, y=1.25, z=0.95))
     )
+
 
 def _pretty_layout(title):
     return dict(
@@ -1652,6 +1771,7 @@ def _pretty_layout(title):
         )
     )
 
+
 def _surface_style(base_rgb, opacity=0.16):
     return dict(
         opacity=float(opacity),
@@ -1661,6 +1781,7 @@ def _surface_style(base_rgb, opacity=0.16):
         lightposition=dict(x=100, y=200, z=100)
     )
 
+
 def _points_style(colors):
     return dict(
         size=5,
@@ -1668,6 +1789,7 @@ def _points_style(colors):
         opacity=0.95,
         line=dict(width=0.6, color="rgba(0,0,0,0.35)")
     )
+
 
 # ============================================================
 # TAB 5 — 3D
@@ -1679,8 +1801,13 @@ with tab5:
         st.info("Run Tab 2 first (Numerical Optimization).")
         st.stop()
 
+    if df_filtered is None or len(df_filtered) == 0:
+        st.info("Go to Tab 1 and load data first.")
+        st.stop()
+
     unit = _get_unit()
 
+    # NumOpt params
     dp = float(st.session_state["dp"])
     pp = float(st.session_state["pp"])
     hp = float(st.session_state["hp"])
@@ -1688,65 +1815,69 @@ with tab5:
     best_df_name = st.session_state.get("best_df_name", "")
     best_optimizer = st.session_state.get("best_optimizer", "")
 
-    # highlight NumOpt
+    # headline
     st.markdown("### ⭐ Solubility Parameters — Numerical Optimization (Optimized)")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("δd (center)", f"{dp:.4f} {unit}")
     m2.metric("δp (center)", f"{pp:.4f} {unit}")
     m3.metric("δh (center)", f"{hp:.4f} {unit}")
     m4.metric("R0 (radius)", f"{R0:.4f} {unit}")
+
     mm1, mm2, mm3 = st.columns([1.4, 1.2, 1.4])
     mm1.metric("Best DF", str(best_df_name))
     mm2.metric("Optimizer", str(best_optimizer))
-    mm3.metric("CV scheme", "LOGO" if use_group else "LOO")
+    mm3.metric("CV scheme", "LOGO" if bool(use_group) else "LOO")
 
     # controls
     c1, c2, c3 = st.columns([1.1, 1.0, 1.0])
     with c1:
         RUN_3D = st.checkbox("Enable 3D plots", value=True)
         show_points = st.checkbox("Show sample points", value=True)
+        show_overlay = st.checkbox("Show overlay", value=True)
     with c2:
         ISO_LEVELS = st.multiselect(
             "ISO_LEVELS (p≈iso)",
-            options=[0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90],
-            default=[0.50, 0.80]
+            options=[0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90],
+            default=[0.50, 0.70]  # <- mais robusto que 0.80
         )
         if len(ISO_LEVELS) == 0:
             ISO_LEVELS = [0.50]
     with c3:
-        GRID_PAD = st.slider("GRID_PAD", 0.5, 3.0, float(st.session_state.get("GRID_PAD", 1.5)), 0.1)
-        GRID_N = st.slider("GRID_N", 18, 42, int(st.session_state.get("GRID_N", 28)), 1)
-        SHELL_DELTA = st.slider("SHELL_DELTA", 0.01, 0.20, float(st.session_state.get("SHELL_DELTA", 0.05)), 0.01)
+        GRID_PAD = st.slider("GRID_PAD", 0.5, 3.0, float(st.session_state.get("GRID_PAD", 2.0)), 0.1)
+        GRID_N = st.slider("GRID_N", 18, 42, int(st.session_state.get("GRID_N", 32)), 1)
+        SHELL_DELTA = st.slider("SHELL_DELTA", 0.01, 0.25, float(st.session_state.get("SHELL_DELTA", 0.07)), 0.01)
+        MIN_POINTS = st.slider("MIN_POINTS (shell)", 30, 200, int(st.session_state.get("MIN_POINTS", 80)), 5)
 
-    # store configs for export
     st.session_state["GRID_PAD"] = float(GRID_PAD)
     st.session_state["GRID_N"] = int(GRID_N)
     st.session_state["ISO_LEVELS"] = [float(x) for x in ISO_LEVELS]
     st.session_state["SHELL_DELTA"] = float(SHELL_DELTA)
+    st.session_state["MIN_POINTS"] = int(MIN_POINTS)
 
     if not RUN_3D:
         st.stop()
 
-    # need ML builders from Tab 3
+    # Need ML functions from Tab 3
     if ("proba_ml_in" not in st.session_state) and ("best_ml_name" not in st.session_state):
         st.info("Run Tab 3 (ML in-sample) or Tab 4 (CV) to define ML model for 3D.")
         st.stop()
 
+    # pick ML model name
     best_ml_name = st.session_state.get("best_ml_name", None)
     if best_ml_name is None:
-        # fallback: first cached ML model
         proba_ml_in = st.session_state.get("proba_ml_in", {})
         best_ml_name = list(proba_ml_in.keys())[0] if len(proba_ml_in) else "XGBoost"
         st.session_state["best_ml_name"] = best_ml_name
 
-    # build calibrated ML model for 3D using all data
+    # build calibrated ML model using all data
     y_bin = df_filtered["solubility"].values.astype(int)
-    X_all = df_filtered[["delta_d","delta_p","delta_h"]].values
+    X_all = df_filtered[["delta_d", "delta_p", "delta_h"]].values
     w_local = np.asarray(w, float)
     min_n_iso = int(st.session_state.get("CALIB_MIN_N_ISO", 60))
 
-    p0_all = float(np.clip(np.average(y_bin, weights=w_local), 1e-12, 1-1e-12))
+    p0_all = float(np.clip(np.average(y_bin, weights=w_local), 1e-12, 1 - 1e-12))
     full_base = make_base_models(42, base_score=p0_all)
+
     if best_ml_name not in full_base:
         st.warning(f"3D: Model '{best_ml_name}' not available; using XGBoost.")
         best_ml_name = "XGBoost"
@@ -1777,16 +1908,22 @@ with tab5:
     fig_h.update_layout(scene=_pretty_scene(unit=unit))
     st.plotly_chart(fig_h, use_container_width=True)
 
-    ml_spheres_rows = []
-
     # (B)/(C) ML spheres per iso
+    ml_spheres_rows = []
     for iso in ISO_LEVELS:
         try:
-            c_ml, r_ml, npts, iso_used, delta_used = ml_shell_sphere_from_grid(
-                df_filtered, model_for_3d,
-                iso=float(iso), pad=float(GRID_PAD), n=int(GRID_N),
-                shell_delta=float(SHELL_DELTA), min_points=120
+            c_ml, r_ml, npts, iso_used, delta_used, meta = ml_shell_sphere_from_grid(
+                df_filtered,
+                model_for_3d,
+                iso=float(iso),
+                pad=float(GRID_PAD),
+                n=int(GRID_N),
+                shell_delta=float(SHELL_DELTA),
+                min_points=int(MIN_POINTS),
+                max_tries=10,
+                auto_expand=True
             )
+
             xs_ml, ys_ml, zs_ml = sphere_mesh(c_ml, r_ml)
 
             ml_spheres_rows.append({
@@ -1794,21 +1931,28 @@ with tab5:
                 "iso_target": float(iso),
                 "iso_used": float(iso_used),
                 "shell_delta_used": float(delta_used),
+                "mode": str(meta.get("mode", "")),
+                "tries": int(meta.get("tries", 0)),
                 "center_delta_d": float(c_ml[0]),
                 "center_delta_p": float(c_ml[1]),
                 "center_delta_h": float(c_ml[2]),
                 "R_ml": float(r_ml),
                 "unit": str(unit),
-                "n_grid_points_shell": int(npts),
-                "GRID_PAD": float(GRID_PAD),
-                "GRID_N": int(GRID_N)
+                "n_grid_points_sel": int(npts),
+                "GRID_PAD": float(meta.get("GRID_PAD", GRID_PAD)),
+                "GRID_N": int(meta.get("GRID_N", GRID_N)),
+                "p_min_grid": float(meta.get("p_min", np.nan)),
+                "p_max_grid": float(meta.get("p_max", np.nan)),
+                "frac_high": float(meta.get("frac_high", np.nan)),
+                "last_shell_pts": int(meta.get("last_shell_pts", 0)),
+                "MIN_POINTS": int(MIN_POINTS)
             })
 
             # (B) ML only
             fig_ml = go.Figure()
             fig_ml.add_trace(go.Surface(
                 x=xs_ml, y=ys_ml, z=zs_ml,
-                name=f"{best_ml_name} shell-sphere (p≈{iso:.2f})",
+                name=f"{best_ml_name} (p≈{iso:.2f})",
                 legendgroup="ml",
                 **_surface_style(ML_COLOR, opacity=0.18)
             ))
@@ -1818,66 +1962,75 @@ with tab5:
                     mode="markers", marker=_points_style(colors),
                     text=labels, name="Samples", legendgroup="pts"
                 ))
-            extra = f" | shell Δ={delta_used:.2f}" if delta_used > 0 else " | fallback: volume p≥iso"
+
+            extra = f" | mode={meta.get('mode','')}, iso_used={iso_used:.2f}" + (
+                f", Δ={delta_used:.2f}" if delta_used > 0 else ""
+            )
             fig_ml.update_layout(**_pretty_layout(
-                title=f"3D (B) — ML shell-sphere p≈{iso:.2f} | {best_ml_name} | R≈{r_ml:.3f} {unit}{extra}"
+                title=f"3D (B) — ML shell/volume sphere | target iso={iso:.2f} | {best_ml_name}{extra}"
             ))
             fig_ml.update_layout(scene=_pretty_scene(unit=unit))
             st.plotly_chart(fig_ml, use_container_width=True)
 
             # (C) Overlay
-            fig_ov = go.Figure()
-            fig_ov.add_trace(go.Surface(
-                x=xs_h, y=ys_h, z=zs_h,
-                name="Numerical Optimization (RED=1)",
-                legendgroup="opti",
-                **_surface_style(OPTI_COLOR, opacity=0.12)
-            ))
-            fig_ov.add_trace(go.Surface(
-                x=xs_ml, y=ys_ml, z=zs_ml,
-                name=f"ML shell-sphere (p≈{iso:.2f}) — {best_ml_name}",
-                legendgroup="ml",
-                **_surface_style(ML_COLOR, opacity=0.12)
-            ))
-            if show_points:
-                fig_ov.add_trace(go.Scatter3d(
-                    x=df_filtered["delta_d"], y=df_filtered["delta_p"], z=df_filtered["delta_h"],
-                    mode="markers", marker=_points_style(colors),
-                    text=labels, name="Samples", legendgroup="pts"
+            if show_overlay:
+                fig_ov = go.Figure()
+                fig_ov.add_trace(go.Surface(
+                    x=xs_h, y=ys_h, z=zs_h,
+                    name="NumOpt (RED=1)",
+                    legendgroup="opti",
+                    **_surface_style(OPTI_COLOR, opacity=0.12)
                 ))
-            fig_ov.update_layout(**_pretty_layout(
-                title=f"3D (C) — Overlay: NumOpt (RED=1) vs ML shell-sphere (p≈{iso:.2f}) | {best_ml_name}"
-            ))
-            fig_ov.update_layout(scene=_pretty_scene(unit=unit))
-            st.plotly_chart(fig_ov, use_container_width=True)
+                fig_ov.add_trace(go.Surface(
+                    x=xs_ml, y=ys_ml, z=zs_ml,
+                    name=f"ML (p≈{iso:.2f}) — {best_ml_name}",
+                    legendgroup="ml",
+                    **_surface_style(ML_COLOR, opacity=0.12)
+                ))
+                if show_points:
+                    fig_ov.add_trace(go.Scatter3d(
+                        x=df_filtered["delta_d"], y=df_filtered["delta_p"], z=df_filtered["delta_h"],
+                        mode="markers", marker=_points_style(colors),
+                        text=labels, name="Samples", legendgroup="pts"
+                    ))
+                fig_ov.update_layout(**_pretty_layout(
+                    title=f"3D (C) — Overlay: NumOpt (RED=1) vs ML (target iso={iso:.2f}) | {best_ml_name}"
+                ))
+                fig_ov.update_layout(scene=_pretty_scene(unit=unit))
+                st.plotly_chart(fig_ov, use_container_width=True)
 
         except Exception as e:
-            st.warning(f"[ML-SHELL-SPHERE] Failed at iso={iso:.2f}: {e}")
-            st.info("Suggestion: increase GRID_N (e.g., 32) and/or GRID_PAD (e.g., 2.0), or reduce ISO_LEVELS.")
+            st.warning(f"[ML-SHELL-SPHERE] Failed at iso={float(iso):.2f}: {e}")
+            st.info("Suggestion: increase GRID_N (e.g., 32–40) and/or GRID_PAD (e.g., 2.0–2.6), "
+                    "increase SHELL_DELTA / lower MIN_POINTS, or reduce ISO_LEVELS (e.g., keep only 0.50).")
 
     df_ml_spheres = pd.DataFrame(ml_spheres_rows)
     st.session_state["df_ml_spheres"] = df_ml_spheres
 
-    # ML highlight (most stable = max grid points)
+    # ML highlight
     if not df_ml_spheres.empty:
-        st.markdown("### ⭐ ML Shell-Sphere — Fitted Parameters (Highlight)")
+        st.markdown("### ⭐ ML Shell/Volume Sphere — Fitted Parameters (Highlight)")
         df2 = df_ml_spheres.copy()
-        df2["n_grid_points_shell"] = pd.to_numeric(df2["n_grid_points_shell"], errors="coerce").fillna(0).astype(int)
-        best_row = df2.sort_values("n_grid_points_shell", ascending=False).iloc[0].to_dict()
+        df2["n_grid_points_sel"] = pd.to_numeric(df2["n_grid_points_sel"], errors="coerce").fillna(0).astype(int)
+        best_row = df2.sort_values("n_grid_points_sel", ascending=False).iloc[0].to_dict()
 
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("ML model", str(best_row.get("ML_model","")))
-        s2.metric("iso (used)", f"{float(best_row.get('iso_used', np.nan)):.2f}")
+        s1.metric("ML model", str(best_row.get("ML_model", "")))
+        s2.metric("iso used", f"{float(best_row.get('iso_used', np.nan)):.2f}")
         s3.metric("R_ml", f"{float(best_row.get('R_ml', np.nan)):.4f} {unit}")
-        s4.metric("grid points", f"{int(best_row.get('n_grid_points_shell', 0))}")
+        s4.metric("grid pts", f"{int(best_row.get('n_grid_points_sel', 0))}")
 
         t1, t2, t3 = st.columns(3)
-        t1.metric("δd_ml (center)", f"{float(best_row.get('center_delta_d', np.nan)):.4f} {unit}")
-        t2.metric("δp_ml (center)", f"{float(best_row.get('center_delta_p', np.nan)):.4f} {unit}")
-        t3.metric("δh_ml (center)", f"{float(best_row.get('center_delta_h', np.nan)):.4f} {unit}")
+        t1.metric("δd_ml", f"{float(best_row.get('center_delta_d', np.nan)):.4f} {unit}")
+        t2.metric("δp_ml", f"{float(best_row.get('center_delta_p', np.nan)):.4f} {unit}")
+        t3.metric("δh_ml", f"{float(best_row.get('center_delta_h', np.nan)):.4f} {unit}")
 
-        with st.expander("ML shell-sphere full table"):
+        with st.expander("ML sphere table (all iso)"):
             st.dataframe(df_ml_spheres, use_container_width=True)
+
+    else:
+        st.info("No ML spheres extracted (all iso levels failed). Try increasing GRID_N / GRID_PAD or reduce ISO_LEVELS.")
+
 
 # ============================================================
 # TAB 6 — Export Excel
@@ -1889,9 +2042,13 @@ with tab6:
         st.info("Run Tab 2 first.")
         st.stop()
 
+    if df_filtered is None or len(df_filtered) == 0:
+        st.info("Go to Tab 1 and load data first.")
+        st.stop()
+
     unit = _get_unit()
 
-    # gather NumOpt
+    # NumOpt params
     dp = float(st.session_state["dp"])
     pp = float(st.session_state["pp"])
     hp = float(st.session_state["hp"])
@@ -1902,11 +2059,12 @@ with tab6:
     K_PROB = float(st.session_state.get("K_PROB", 6.0))
     REG_R0 = float(st.session_state.get("REG_R0", 0.05))
 
+    # In-sample stored
     p_numopt_in = st.session_state.get("p_numopt_in", None)
     RED_all = st.session_state.get("RED_all", None)
     thr_numopt_in = float(st.session_state.get("thr_numopt_in", 0.5))
 
-    # CV
+    # CV stored
     p_numopt_cv = st.session_state.get("p_numopt_cv", None)
     p_ml_cv = st.session_state.get("p_ml_cv", {})
     cv_label = st.session_state.get("cv_label", "CV")
@@ -1918,17 +2076,17 @@ with tab6:
     # ML in-sample
     proba_ml_in = st.session_state.get("proba_ml_in", {})
 
-    # other tables
+    # Other tables
     df_all_runs = st.session_state.get("df_all_runs", pd.DataFrame())
     df_ml_spheres = st.session_state.get("df_ml_spheres", pd.DataFrame())
 
-    # metrics
+    # Metrics
     df_metrics_in_unw = st.session_state.get("df_metrics_in_unw", pd.DataFrame())
     df_metrics_in_w   = st.session_state.get("df_metrics_in_w", pd.DataFrame())
     df_metrics_cv_unw = st.session_state.get("df_metrics_cv_unw", pd.DataFrame())
     df_metrics_cv_w   = st.session_state.get("df_metrics_cv_w", pd.DataFrame())
 
-    # final highlight
+    # Summary cards
     st.markdown("## ✅ Final Highlight — Numerical Optimization vs ML")
     best_ml_name = st.session_state.get("best_ml_name", "")
 
@@ -1956,7 +2114,7 @@ with tab6:
         else:
             st.info("Run Tab 4 (CV) to populate Best-ML metrics.")
 
-    # results_per_sample
+    # Build per-sample table
     out = df_filtered.copy()
     out["y_raw"] = np.asarray(y_raw, float)
     out["w"] = np.asarray(w, float)
@@ -1968,13 +2126,13 @@ with tab6:
     if p_numopt_cv is not None:
         out[f"p_numopt_{cv_label}"] = np.asarray(p_numopt_cv, float)
 
-    for name, p in proba_ml_in.items():
+    for name, p in (proba_ml_in or {}).items():
         out[f"proba_{name}_in"] = np.asarray(p, float)
     if isinstance(p_ml_cv, dict) and len(p_ml_cv):
         for name, p in p_ml_cv.items():
             out[f"proba_{name}_{cv_label}"] = np.asarray(p, float)
 
-    # params sheet
+    # Params sheet
     df_params_numopt = pd.DataFrame({
         "Parameter": [
             "DF_best", "optimizer_best",
@@ -1992,33 +2150,34 @@ with tab6:
         ]
     })
 
-    # metadata
+    # Metadata
     n_total = int(len(df_filtered))
     n_pos = int(np.sum(df_filtered["solubility"].values.astype(int)))
     n_neg = int(n_total - n_pos)
     n_partial = int(np.sum(np.asarray(y_raw, float) == 0.5))
-    n_groups = int(len(np.unique(groups))) if use_group else 0
+    n_groups = int(len(np.unique(groups))) if bool(use_group) and (groups is not None) else 0
 
     colmap = st.session_state.get("colmap", {})
     df_meta = pd.DataFrame([
-        {"Item":"app_version", "Value": st.session_state.get("app_version","")},
-        {"Item":"run_timestamp_utc", "Value": st.session_state.get("run_timestamp","")},
-        {"Item":"sheet_name", "Value": st.session_state.get("sheet_name","")},
-        {"Item":"colmap", "Value": str(colmap)},
-        {"Item":"N_total", "Value": n_total},
-        {"Item":"N_pos_bin", "Value": n_pos},
-        {"Item":"N_neg", "Value": n_neg},
-        {"Item":"N_partial_0.5", "Value": n_partial},
-        {"Item":"use_group", "Value": bool(use_group)},
-        {"Item":"group_col", "Value": st.session_state.get("group_col","None")},
-        {"Item":"N_groups", "Value": n_groups},
-        {"Item":"GRID_PAD", "Value": st.session_state.get("GRID_PAD","")},
-        {"Item":"GRID_N", "Value": st.session_state.get("GRID_N","")},
-        {"Item":"ISO_LEVELS", "Value": str(st.session_state.get("ISO_LEVELS",""))},
-        {"Item":"SHELL_DELTA", "Value": st.session_state.get("SHELL_DELTA","")},
-        {"Item":"K_PROB", "Value": K_PROB},
-        {"Item":"REG_R0", "Value": REG_R0},
-        {"Item":"min_n_isotonic", "Value": int(st.session_state.get("CALIB_MIN_N_ISO", 60))},
+        {"Item": "app_version", "Value": st.session_state.get("app_version", "")},
+        {"Item": "run_timestamp_utc", "Value": st.session_state.get("run_timestamp", "")},
+        {"Item": "sheet_name", "Value": st.session_state.get("sheet_name", "")},
+        {"Item": "colmap", "Value": str(colmap)},
+        {"Item": "N_total", "Value": n_total},
+        {"Item": "N_pos_bin", "Value": n_pos},
+        {"Item": "N_neg", "Value": n_neg},
+        {"Item": "N_partial_0.5", "Value": n_partial},
+        {"Item": "use_group", "Value": bool(use_group)},
+        {"Item": "group_col", "Value": st.session_state.get("group_col", "None")},
+        {"Item": "N_groups", "Value": n_groups},
+        {"Item": "GRID_PAD", "Value": st.session_state.get("GRID_PAD", "")},
+        {"Item": "GRID_N", "Value": st.session_state.get("GRID_N", "")},
+        {"Item": "ISO_LEVELS", "Value": str(st.session_state.get("ISO_LEVELS", ""))},
+        {"Item": "SHELL_DELTA", "Value": st.session_state.get("SHELL_DELTA", "")},
+        {"Item": "MIN_POINTS", "Value": st.session_state.get("MIN_POINTS", "")},
+        {"Item": "K_PROB", "Value": K_PROB},
+        {"Item": "REG_R0", "Value": REG_R0},
+        {"Item": "min_n_isotonic", "Value": int(st.session_state.get("CALIB_MIN_N_ISO", 60))},
     ])
 
     filename = st.text_input("Output filename (.xlsx)", value=f"result_full_paper_{cv_label}_cal_shell.xlsx")
@@ -2027,16 +2186,16 @@ with tab6:
     if export_btn:
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            # base
+            # Base
             df_filtered.to_excel(writer, index=False, sheet_name="Base_bin")
             out.to_excel(writer, index=False, sheet_name="Results_per_sample")
 
-            # numopt
+            # NumOpt
             if df_all_runs is not None and not df_all_runs.empty:
                 df_all_runs.to_excel(writer, index=False, sheet_name="NumOpt_AllRuns")
             df_params_numopt.to_excel(writer, index=False, sheet_name="NumOpt_Final")
 
-            # metrics
+            # Metrics
             if df_metrics_in_unw is not None and not df_metrics_in_unw.empty:
                 df_metrics_in_unw.to_excel(writer, index=False, sheet_name="Metrics_IN_unweighted")
             if df_metrics_in_w is not None and not df_metrics_in_w.empty:
@@ -2046,11 +2205,11 @@ with tab6:
             if df_metrics_cv_w is not None and not df_metrics_cv_w.empty:
                 df_metrics_cv_w.to_excel(writer, index=False, sheet_name=f"Metrics_{cv_label}_weighted")
 
-            # ml spheres
+            # ML spheres
             if df_ml_spheres is not None and not df_ml_spheres.empty:
                 df_ml_spheres.to_excel(writer, index=False, sheet_name="ML_ShellSpheres")
 
-            # metadata
+            # Metadata
             df_meta.to_excel(writer, index=False, sheet_name="Run_Metadata")
 
         bio.seek(0)
