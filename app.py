@@ -32,6 +32,26 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
+import streamlit as st
+
+st.set_page_config(page_title="Solubility App", layout="wide")
+
+# =========================
+# SIDEBAR — CACHE CONTROL
+# =========================
+with st.sidebar:
+    st.markdown("## ⚙️ Cache")
+    if st.button("🧹 Limpar cache (st.cache_data)", use_container_width=True):
+        st.cache_data.clear()
+        for k in [
+            "proba_ml_in", "p_numopt_cv", "p_ml_cv",
+            "df_metrics_in_unw", "df_metrics_in_w",
+            "df_metrics_cv_unw", "df_metrics_cv_w"
+        ]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.success("Cache limpo.")
+        st.rerun()
 
 # -----------------------------
 # Streamlit config + 6 TABS
@@ -2176,3 +2196,4 @@ with tab6:
         )
 
 # FIM — PARTE 4/4
+
