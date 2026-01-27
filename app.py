@@ -882,22 +882,26 @@ with tab2:
             k_prob=float(K_PROB)
         )
         st.pyplot(fig_map, clear_figure=True)
+
 # ============================================================
-# APP.PY — PARTE 3/4 (TAB 3 + TAB 4) — COMPLETA (OTIMIZADA)
-#  ✅ Tab 3: ML (Calibrated) — in-sample
-#  ✅ Tab 4: Cross-Validation (LOGO/LOO) — out-of-fold probabilities
+# APP.PY — PARTE 3/4 (COMPLETA E CORRIGIDA)
+#  Aba 3: ML (Calibrated) — in-sample
+#  Aba 4: Cross-Validation (LOGO/LOO) — out-of-fold probabilities
 #
-#  🔥 Correções para "CV não termina com XGBoost":
-#   (1) NÃO materializa splits = list(...) (evita travar/memória no LOO)
-#   (2) Barra de progresso + status
-#   (3) XGBoost "CV-friendly" (mais leve) somente no CV
-#   (4) Opção "Calibrate in CV" (default: OFF) -> CV MUITO mais rápido
-#   (5) Guardas para folds com classe única
+#  ✅ Correções principais desta versão:
+#   (A) FIX DEFINITIVO do erro "check_consistent_length" no ranking (AUPRC):
+#       - valida len(p) vs len(y) antes de average_precision_score
+#       - pula modelos com cache "stale" ao invés de quebrar o app
+#   (B) BOTÃO opcional para limpar cache + estados ML/CV (Streamlit Cloud friendly)
+#   (C) Robustez:
+#       - conversões para np.array 1D
+#       - guardas para folds single-class
+#       - valida shapes no display e no ranking (IN e CV)
 #
-#  Requisitos (Partes 1/4 e 2/4):
+#  Requisitos (Partes 1/4 e 2/4 já carregadas no mesmo app.py):
 #   - df_filtered, y_raw, w, use_group, groups
-#   - Tab 2 rodado: st.session_state["numopt_done"], "p_numopt_in", "thr_numopt_in",
-#                   "dp","pp","hp","R0","best_df_name"
+#   - st.session_state["numopt_done"], p_numopt_in, thr_numopt_in
+#   - funções: make_base_models / calibrate_model serão definidas AQUI (e usadas na Parte 4/4)
 # ============================================================
 
 import numpy as np
@@ -914,26 +918,56 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 
-from xgboost import XGBClassifier
-
+# XGBoost import robusto (evita quebrar se não instalado)
+try:
+    from xgboost import XGBClassifier
+    _HAS_XGB = True
+except Exception:
+    _HAS_XGB = False
 
 # ------------------------------------------------------------
-# Plot helpers
+# Sidebar utilities (cache cleaning)
+# ------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### Utilities")
+    if st.button("🧹 Clear caches (ML/CV)", use_container_width=True):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+        # limpar estados que causam inconsistência
+        for k in [
+            "proba_ml_in",
+            "p_numopt_cv", "p_ml_cv", "cv_label", "cv_last_error",
+            "df_metrics_in_unw", "df_metrics_in_w",
+            "df_metrics_cv_unw", "df_metrics_cv_w",
+            "best_ml_name"
+        ]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
+
+# ------------------------------------------------------------
+# Plot helpers (matplotlib -> streamlit)
 # ------------------------------------------------------------
 def _article_axes(ax):
     ax.grid(True, alpha=0.25)
     for spine in ax.spines.values():
         spine.set_alpha(0.6)
 
-
 def plot_roc_pretty(y_true, curves, title="ROC Curve", subtitle=None):
+    y_true = np.asarray(y_true, int).reshape(-1)
     if len(np.unique(y_true)) < 2:
         return None
     fig = plt.figure(figsize=(6.6, 5.2), dpi=160)
     from sklearn.metrics import roc_curve, auc
     ax = fig.gca()
     for c in curves:
-        fpr, tpr, _ = roc_curve(y_true, c["p"])
+        p = np.asarray(c["p"], float).reshape(-1)
+        if len(p) != len(y_true):
+            continue
+        fpr, tpr, _ = roc_curve(y_true, p)
         ax.plot(fpr, tpr, label=f'{c["label"]} (AUC={auc(fpr,tpr):.2f})', lw=c.get("lw", 1.6))
     ax.plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
     ax.set_xlabel("False Positive Rate")
@@ -944,15 +978,18 @@ def plot_roc_pretty(y_true, curves, title="ROC Curve", subtitle=None):
     fig.tight_layout()
     return fig
 
-
 def plot_pr_pretty(y_true, curves, title="Precision–Recall Curve", subtitle=None):
+    y_true = np.asarray(y_true, int).reshape(-1)
     if len(np.unique(y_true)) < 2:
         return None
     fig = plt.figure(figsize=(6.6, 5.2), dpi=160)
     ax = fig.gca()
     for c in curves:
-        prec, rec, _ = precision_recall_curve(y_true, c["p"])
-        ap = average_precision_score(y_true, c["p"])
+        p = np.asarray(c["p"], float).reshape(-1)
+        if len(p) != len(y_true):
+            continue
+        prec, rec, _ = precision_recall_curve(y_true, p)
+        ap = average_precision_score(y_true, p)
         ax.plot(rec, prec, label=f'{c["label"]} (AP={ap:.2f})', lw=c.get("lw", 1.6))
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
@@ -962,13 +999,16 @@ def plot_pr_pretty(y_true, curves, title="Precision–Recall Curve", subtitle=No
     fig.tight_layout()
     return fig
 
-
 def plot_calibration_pretty(y_true, probas_dict, title="Calibration (Reliability) Plot", subtitle=None, n_bins=10):
+    y_true = np.asarray(y_true, int).reshape(-1)
     if len(np.unique(y_true)) < 2:
         return None
     fig = plt.figure(figsize=(6.6, 5.2), dpi=160)
     ax = fig.gca()
     for label, p in probas_dict.items():
+        p = np.asarray(p, float).reshape(-1)
+        if len(p) != len(y_true):
+            continue
         frac_pos, mean_pred = calibration_curve(y_true, p, n_bins=n_bins, strategy="quantile")
         ax.plot(mean_pred, frac_pos, marker="o", lw=1.4, label=label)
     ax.plot([0, 1], [0, 1], "--", color="gray", lw=1.0, alpha=0.8)
@@ -980,81 +1020,54 @@ def plot_calibration_pretty(y_true, probas_dict, title="Calibration (Reliability
     fig.tight_layout()
     return fig
 
-
 # ------------------------------------------------------------
-# ML builders + (optional) calibration
+# ML builders + calibration
 # ------------------------------------------------------------
 CALIBRATION_METHOD_HIGHN = "isotonic"
 CALIBRATION_METHOD_LOWN  = "sigmoid"
 
-
-def make_base_models(random_state=42, base_score=None, profile="full"):
-    """
-    profile:
-      - "full" : melhor (mais pesado)
-      - "cv"   : rápido para CV (recomendado)
-    """
+def make_base_models(random_state=42, base_score=None):
     models = {}
 
-    if str(profile).lower().strip() == "cv":
-        # CV-friendly: muito mais leve
+    if _HAS_XGB:
         models["XGBoost"] = XGBClassifier(
-            n_estimators=140,
-            max_depth=3,
-            learning_rate=0.07,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_lambda=1.0,
-            random_state=random_state,
+            n_estimators=450, max_depth=3, learning_rate=0.05,
+            subsample=0.9, colsample_bytree=0.9,
+            reg_lambda=1.0, random_state=random_state,
             eval_metric="logloss",
-            base_score=float(base_score) if base_score is not None else 0.5,
-            n_jobs=1,
-            tree_method="hist"
+            base_score=float(base_score) if base_score is not None else 0.5
         )
-        models["RandomForest"] = RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1)
-        models["SVM-RBF"] = SVC(C=2.0, gamma="scale", probability=True, random_state=random_state)
-        return models
 
-    # full (in-sample e análises)
-    models["XGBoost"] = XGBClassifier(
-        n_estimators=450, max_depth=3, learning_rate=0.05,
-        subsample=0.9, colsample_bytree=0.9,
-        reg_lambda=1.0, random_state=random_state,
-        eval_metric="logloss",
-        base_score=float(base_score) if base_score is not None else 0.5,
-        n_jobs=1,
-        tree_method="hist"
-    )
-    models["RandomForest"] = RandomForestClassifier(n_estimators=700, random_state=random_state, n_jobs=-1)
+    models["RandomForest"] = RandomForestClassifier(n_estimators=700, random_state=random_state)
+
+    # SVM retorna predict_proba somente se probability=True
     models["SVM-RBF"] = SVC(C=2.0, gamma="scale", probability=True, random_state=random_state)
+
     return models
 
+def calibrate_model(base_estimator, X_tr, y_tr, w_tr, min_n_iso=60):
+    y_tr = np.asarray(y_tr, int).reshape(-1)
+    w_tr = np.asarray(w_tr, float).reshape(-1)
 
-def calibrate_model(base_estimator, X_tr, y_tr, w_tr, min_n_iso=60, cv_cal=2, force_method=None):
-    """
-    Calibração robusta.
-    - Para CV, use cv_cal=2 e force_method="sigmoid" (muito mais rápido/estável).
-    - Para in-sample, pode usar isotonic se N for suficiente.
-    """
-    method = force_method or (CALIBRATION_METHOD_HIGHN if len(y_tr) >= int(min_n_iso) else CALIBRATION_METHOD_LOWN)
+    method = CALIBRATION_METHOD_HIGHN if len(y_tr) >= int(min_n_iso) else CALIBRATION_METHOD_LOWN
 
     try:
-        cal = CalibratedClassifierCV(base_estimator, method=method, cv=int(cv_cal))
+        cal = CalibratedClassifierCV(base_estimator, method=method, cv=3)
         try:
             cal.fit(X_tr, y_tr, sample_weight=w_tr)
         except TypeError:
+            # alguns estimadores não aceitam sample_weight na calibração direta
             base_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
             cal = CalibratedClassifierCV(base_estimator, method=method, cv="prefit")
             cal.fit(X_tr, y_tr)
         return cal
     except Exception:
-        # fallback: sem calibração
+        # fallback: fit sem calibração
         try:
             base_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
         except Exception:
             base_estimator.fit(X_tr, y_tr)
         return base_estimator
-
 
 # ------------------------------------------------------------
 # Metrics helpers (weighted + unweighted)
@@ -1062,64 +1075,63 @@ def calibrate_model(base_estimator, X_tr, y_tr, w_tr, min_n_iso=60, cv_cal=2, fo
 def _safe_div(a, b):
     return float(a) / float(b) if float(b) != 0 else np.nan
 
-
 def weighted_confusion(y_true, y_pred, sample_weight=None):
-    y_true = np.asarray(y_true).astype(int)
-    y_pred = np.asarray(y_pred).astype(int)
-    sw = np.ones_like(y_true, dtype=float) if sample_weight is None else np.asarray(sample_weight, dtype=float)
-    TN = sw[(y_true == 0) & (y_pred == 0)].sum()
-    FP = sw[(y_true == 0) & (y_pred == 1)].sum()
-    FN = sw[(y_true == 1) & (y_pred == 0)].sum()
-    TP = sw[(y_true == 1) & (y_pred == 1)].sum()
+    y_true = np.asarray(y_true).astype(int).reshape(-1)
+    y_pred = np.asarray(y_pred).astype(int).reshape(-1)
+    sw = np.ones_like(y_true, dtype=float) if sample_weight is None else np.asarray(sample_weight, dtype=float).reshape(-1)
+    TN = sw[(y_true==0) & (y_pred==0)].sum()
+    FP = sw[(y_true==0) & (y_pred==1)].sum()
+    FN = sw[(y_true==1) & (y_pred==0)].sum()
+    TP = sw[(y_true==1) & (y_pred==1)].sum()
     return TN, FP, FN, TP
 
-
 def weighted_brier(y_true, p, sample_weight=None):
-    y_true = np.asarray(y_true).astype(float)
-    p = np.asarray(p).astype(float)
+    y_true = np.asarray(y_true).astype(float).reshape(-1)
+    p = np.asarray(p).astype(float).reshape(-1)
     if sample_weight is None:
-        return float(np.mean((p - y_true) ** 2))
-    sw = np.asarray(sample_weight, dtype=float)
-    return float(np.sum(sw * (p - y_true) ** 2) / np.sum(sw))
-
+        return float(np.mean((p - y_true)**2))
+    sw = np.asarray(sample_weight, dtype=float).reshape(-1)
+    return float(np.sum(sw*(p - y_true)**2) / np.sum(sw))
 
 def weighted_logloss(y_true, p, sample_weight=None, eps=1e-12):
-    y_true = np.asarray(y_true).astype(float)
-    p = np.clip(np.asarray(p).astype(float), eps, 1 - eps)
-    ll = -(y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
+    y_true = np.asarray(y_true).astype(float).reshape(-1)
+    p = np.clip(np.asarray(p).astype(float).reshape(-1), eps, 1-eps)
+    ll = -(y_true*np.log(p) + (1-y_true)*np.log(1-p))
     if sample_weight is None:
         return float(np.mean(ll))
-    sw = np.asarray(sample_weight, dtype=float)
-    return float(np.sum(sw * ll) / np.sum(sw))
-
+    sw = np.asarray(sample_weight, dtype=float).reshape(-1)
+    return float(np.sum(sw*ll) / np.sum(sw))
 
 def weighted_accuracy(y_true, y_pred, sample_weight=None):
-    y_true = np.asarray(y_true).astype(int)
-    y_pred = np.asarray(y_pred).astype(int)
+    y_true = np.asarray(y_true).astype(int).reshape(-1)
+    y_pred = np.asarray(y_pred).astype(int).reshape(-1)
     if sample_weight is None:
         return float(np.mean(y_true == y_pred))
-    sw = np.asarray(sample_weight, dtype=float)
-    return float(np.sum(sw * (y_true == y_pred)) / np.sum(sw))
-
+    sw = np.asarray(sample_weight, dtype=float).reshape(-1)
+    return float(np.sum(sw*(y_true == y_pred)) / np.sum(sw))
 
 def compute_metrics_full(model_name, y_true, p, thr=0.5, sample_weight=None):
-    y_true = np.asarray(y_true).astype(int)
-    p = np.clip(np.asarray(p).astype(float), 1e-12, 1 - 1e-12)
+    y_true = np.asarray(y_true).astype(int).reshape(-1)
+    p = np.clip(np.asarray(p).astype(float).reshape(-1), 1e-12, 1-1e-12)
+
+    if len(p) != len(y_true):
+        return dict(Model=model_name, thr=float(thr), Error="len(p)!=len(y)")
+
     y_pred = (p >= float(thr)).astype(int)
 
     TN, FP, FN, TP = weighted_confusion(y_true, y_pred, sample_weight=sample_weight)
 
-    precision = _safe_div(TP, TP + FP)
-    recall = _safe_div(TP, TP + FN)
-    specificity = _safe_div(TN, TN + FP)
-    f1 = _safe_div(2 * precision * recall, precision + recall)
-    npv = _safe_div(TN, TN + FN)
-    fpr = _safe_div(FP, FP + TN)
-    fnr = _safe_div(FN, FN + TP)
-    bal_acc = np.nan if (recall != recall or specificity != specificity) else 0.5 * (recall + specificity)
+    precision = _safe_div(TP, TP+FP)
+    recall = _safe_div(TP, TP+FN)
+    specificity = _safe_div(TN, TN+FP)
+    f1 = _safe_div(2*precision*recall, precision+recall)
+    npv = _safe_div(TN, TN+FN)
+    fpr = _safe_div(FP, FP+TN)
+    fnr = _safe_div(FN, FN+TP)
+    bal_acc = np.nan if (recall!=recall or specificity!=specificity) else 0.5*(recall+specificity)
 
-    denom = np.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
-    mcc = _safe_div((TP * TN - FP * FN), denom)
+    denom = np.sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+    mcc = _safe_div((TP*TN - FP*FN), denom)
 
     out = dict(
         Model=model_name,
@@ -1145,62 +1157,73 @@ def compute_metrics_full(model_name, y_true, p, thr=0.5, sample_weight=None):
         out["AUC_PR_unweighted"] = float(average_precision_score(y_true, p))
     return out
 
-
 def build_metrics_tables(y, w, p_in, thr_in, p_cv, thr_cv,
                          ml_in_dict, ml_cv_dict, thr_ml=0.5, cv_label="CV"):
+    y = np.asarray(y, int).reshape(-1)
+    w = np.asarray(w, float).reshape(-1)
+    p_in = np.asarray(p_in, float).reshape(-1) if p_in is not None else None
+    p_cv = np.asarray(p_cv, float).reshape(-1) if p_cv is not None else None
+
     rows_in_unw, rows_in_w = [], []
     rows_cv_unw, rows_cv_w = [], []
 
-    rows_in_unw.append(compute_metrics_full("NumericalOptimization_IN (unweighted)", y, p_in, thr=thr_in, sample_weight=None))
-    rows_in_w.append(compute_metrics_full("NumericalOptimization_IN (weighted)", y, p_in, thr=thr_in, sample_weight=w))
+    if p_in is not None and len(p_in) == len(y):
+        rows_in_unw.append(compute_metrics_full("NumericalOptimization_IN (unweighted)", y, p_in, thr=thr_in, sample_weight=None))
+        rows_in_w.append(compute_metrics_full("NumericalOptimization_IN (weighted)", y, p_in, thr=thr_in, sample_weight=w))
 
-    rows_cv_unw.append(compute_metrics_full(f"NumericalOptimization_{cv_label} (unweighted)", y, p_cv, thr=thr_cv, sample_weight=None))
-    rows_cv_w.append(compute_metrics_full(f"NumericalOptimization_{cv_label} (weighted)", y, p_cv, thr=thr_cv, sample_weight=w))
+    if p_cv is not None and len(p_cv) == len(y):
+        rows_cv_unw.append(compute_metrics_full(f"NumericalOptimization_{cv_label} (unweighted)", y, p_cv, thr=thr_cv, sample_weight=None))
+        rows_cv_w.append(compute_metrics_full(f"NumericalOptimization_{cv_label} (weighted)", y, p_cv, thr=thr_cv, sample_weight=w))
 
     for k, p in (ml_in_dict or {}).items():
+        p = np.asarray(p, float).reshape(-1)
+        if len(p) != len(y):
+            continue
         rows_in_unw.append(compute_metrics_full(f"{k}_IN (unweighted)", y, p, thr=thr_ml, sample_weight=None))
         rows_in_w.append(compute_metrics_full(f"{k}_IN (weighted)", y, p, thr=thr_ml, sample_weight=w))
 
     for k, p in (ml_cv_dict or {}).items():
+        p = np.asarray(p, float).reshape(-1)
+        if len(p) != len(y):
+            continue
         rows_cv_unw.append(compute_metrics_full(f"{k}_{cv_label} (unweighted)", y, p, thr=thr_ml, sample_weight=None))
         rows_cv_w.append(compute_metrics_full(f"{k}_{cv_label} (weighted)", y, p, thr=thr_ml, sample_weight=w))
 
     df_in_unw = pd.DataFrame(rows_in_unw)
-    df_in_w = pd.DataFrame(rows_in_w)
+    df_in_w   = pd.DataFrame(rows_in_w)
     df_cv_unw = pd.DataFrame(rows_cv_unw)
-    df_cv_w = pd.DataFrame(rows_cv_w)
+    df_cv_w   = pd.DataFrame(rows_cv_w)
 
-    sort_cols = ["LogLoss", "Brier", "AUC_PR_unweighted", "AUC_ROC_unweighted", "MCC"]
+    sort_cols = ["LogLoss","Brier","AUC_PR_unweighted","AUC_ROC_unweighted","MCC"]
     asc = [True, True, False, False, False]
+
     for dfx in [df_in_unw, df_in_w, df_cv_unw, df_cv_w]:
-        if not dfx.empty:
+        if not dfx.empty and all(c in dfx.columns for c in sort_cols):
             dfx.sort_values(by=sort_cols, ascending=asc, inplace=True)
             dfx.reset_index(drop=True, inplace=True)
 
     return df_in_unw, df_in_w, df_cv_unw, df_cv_w
 
-
 # ------------------------------------------------------------
-# Cache ML in-sample
+# Cache ML in-sample (com assinatura de dados para evitar cache stale)
 # ------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def run_ml_in_cached(X_csv: str, y_tuple: tuple, w_tuple: tuple, min_n_iso: int, chosen_models: tuple):
+def run_ml_in_cached(X_csv: str, y_tuple: tuple, w_tuple: tuple, min_n_iso: int, chosen_models: tuple, data_sig: tuple):
     import io
     X = pd.read_csv(io.StringIO(X_csv)).values
-    y = np.asarray(y_tuple, int)
-    w = np.asarray(w_tuple, float)
+    y = np.asarray(y_tuple, int).reshape(-1)
+    w = np.asarray(w_tuple, float).reshape(-1)
 
-    p0_in = float(np.clip(np.average(y, weights=w), 1e-12, 1 - 1e-12))
-    base = make_base_models(42, base_score=p0_in, profile="full")
+    p0_in = float(np.clip(np.average(y, weights=w), 1e-12, 1-1e-12))
+    base = make_base_models(42, base_score=p0_in)
     base = {k: v for k, v in base.items() if k in set(chosen_models)}
 
     proba_ml_in = {}
     for name, est in base.items():
-        fitted = calibrate_model(est, X, y, w, min_n_iso=int(min_n_iso), cv_cal=3, force_method=None)
+        fitted = calibrate_model(est, X, y, w, min_n_iso=int(min_n_iso))
         if hasattr(fitted, "predict_proba"):
-            proba_ml_in[name] = fitted.predict_proba(X)[:, 1]
+            proba_ml_in[name] = np.asarray(fitted.predict_proba(X)[:, 1], float).reshape(-1)
     return proba_ml_in
-
 
 # ============================================================
 # TAB 3 — ML (Calibrated) IN-SAMPLE
@@ -1213,16 +1236,21 @@ with tab3:
         st.stop()
 
     if df_filtered is None or len(df_filtered) == 0:
-        st.info("Go to Tab 1 andU and load data first.")
+        st.info("Go to Tab 1 and load data first.")
         st.stop()
 
-    y = df_filtered["solubility"].values.astype(int)
-    X = df_filtered[["delta_d", "delta_p", "delta_h"]].values
-    w_local = np.asarray(w, float)
+    y = np.asarray(df_filtered["solubility"].values, int).reshape(-1)
+    X = df_filtered[["delta_d","delta_p","delta_h"]].values
+    w_local = np.asarray(w, float).reshape(-1)
 
     p_numopt_in = st.session_state.get("p_numopt_in", None)
     if p_numopt_in is None:
         st.info("Numerical Optimization probabilities not found. Run Tab 2 again.")
+        st.stop()
+    p_numopt_in = np.asarray(p_numopt_in, float).reshape(-1)
+
+    if len(p_numopt_in) != len(y):
+        st.warning(f"NumOpt probabilities length mismatch: len(p)={len(p_numopt_in)} vs len(y)={len(y)}. Re-run Tab 2.")
         st.stop()
 
     c1, c2, c3 = st.columns([1.0, 1.0, 1.2])
@@ -1238,10 +1266,11 @@ with tab3:
             step=5
         )
     with c3:
+        options = ["RandomForest","SVM-RBF"] + (["XGBoost"] if _HAS_XGB else [])
         keep_models = st.multiselect(
             "Models",
-            ["XGBoost", "RandomForest", "SVM-RBF"],
-            default=["XGBoost", "RandomForest", "SVM-RBF"]
+            options,
+            default=options
         )
         topN = st.number_input("Top-N ML lines in plots", min_value=1, max_value=5, value=2, step=1)
 
@@ -1251,6 +1280,17 @@ with tab3:
         if len(keep_models) == 0:
             st.error("Select at least one ML model.")
             st.stop()
+
+        # assinatura do dataset (evita cache stale)
+        data_sig = (
+            int(len(df_filtered)),
+            float(df_filtered["delta_d"].sum()),
+            float(df_filtered["delta_p"].sum()),
+            float(df_filtered["delta_h"].sum()),
+            float(np.sum(y)),
+            float(np.sum(w_local)),
+        )
+
         with st.spinner("Training/calibrating ML (in-sample)..."):
             X_csv = pd.DataFrame(X).to_csv(index=False)
             proba_ml_in = run_ml_in_cached(
@@ -1258,7 +1298,8 @@ with tab3:
                 y_tuple=tuple(y.tolist()),
                 w_tuple=tuple(w_local.tolist()),
                 min_n_iso=int(min_n_iso),
-                chosen_models=tuple(keep_models)
+                chosen_models=tuple(keep_models),
+                data_sig=data_sig
             )
             st.session_state["proba_ml_in"] = proba_ml_in
             st.session_state["CALIB_MIN_N_ISO"] = int(min_n_iso)
@@ -1270,14 +1311,28 @@ with tab3:
         st.info("No ML cached yet. Click the button above.")
         st.stop()
 
+    # ----------------------------
+    # ROBUST ranking by AUPRC
+    # ----------------------------
     ranked = []
     if len(np.unique(y)) == 2:
         for name, p in proba_ml_in.items():
-            ranked.append((name, float(average_precision_score(y, p))))
+            try:
+                p = np.asarray(p, dtype=float).reshape(-1)
+                if len(p) != len(y):
+                    st.warning(
+                        f"[ML Rank] Skip {name}: len(p)={len(p)} ≠ len(y)={len(y)} "
+                        "(stale cache / dataset changed)"
+                    )
+                    continue
+                ranked.append((name, float(average_precision_score(y, p))))
+            except Exception as e:
+                st.warning(f"[ML Rank] Skip {name}: {e}")
         ranked = sorted(ranked, key=lambda t: -t[1])
     else:
         ranked = [(k, 0.0) for k in proba_ml_in.keys()]
-    keep_for_plot = [n for n, _ in ranked[: int(topN)]]
+
+    keep_for_plot = [n for n, _ in ranked[: int(topN)]] if ranked else list(proba_ml_in.keys())[: int(topN)]
 
     st.write("Models cached:", list(proba_ml_in.keys()))
     st.write("Shown in plots:", keep_for_plot)
@@ -1287,28 +1342,24 @@ with tab3:
         for name in keep_for_plot:
             curves.append({"label": f"{name} (cal)", "p": proba_ml_in[name], "lw": 1.5})
         fig = plot_roc_pretty(y, curves, title="ROC Curve", subtitle="In-sample (calibrated ML)")
-        if fig:
-            st.pyplot(fig, clear_figure=True)
+        if fig: st.pyplot(fig, clear_figure=True)
 
     if len(np.unique(y)) == 2 and RUN_PR:
         curves = [{"label": "Numerical Optimization", "p": p_numopt_in, "lw": 2.2}]
         for name in keep_for_plot:
             curves.append({"label": f"{name} (cal)", "p": proba_ml_in[name], "lw": 1.5})
         fig = plot_pr_pretty(y, curves, title="Precision–Recall Curve", subtitle="In-sample (calibrated ML)")
-        if fig:
-            st.pyplot(fig, clear_figure=True)
+        if fig: st.pyplot(fig, clear_figure=True)
 
     if len(np.unique(y)) == 2 and RUN_CAL:
         calib_dict = {"Numerical Optimization": p_numopt_in}
         for name in keep_for_plot:
             calib_dict[f"{name} (cal)"] = proba_ml_in[name]
         fig = plot_calibration_pretty(y, calib_dict, title="Calibration (Reliability) Plot", subtitle="In-sample", n_bins=10)
-        if fig:
-            st.pyplot(fig, clear_figure=True)
-
+        if fig: st.pyplot(fig, clear_figure=True)
 
 # ============================================================
-# TAB 4 — CV (LOGO/LOO) — FAST & ROBUST
+# TAB 4 — CV (LOGO/LOO)
 # ============================================================
 with tab4:
     st.subheader("Cross-Validation (LOGO/LOO) — Out-of-fold probabilities")
@@ -1327,15 +1378,15 @@ with tab4:
         st.info("Run Tab 3 first (ML in-sample).")
         st.stop()
 
-    y = df_filtered["solubility"].values.astype(int)
-    X = df_filtered[["delta_d", "delta_p", "delta_h"]].values
-    w_local = np.asarray(w, float)
+    y = np.asarray(df_filtered["solubility"].values, int).reshape(-1)
+    X = df_filtered[["delta_d","delta_p","delta_h"]].values
+    w_local = np.asarray(w, float).reshape(-1)
 
-    best_df_name = st.session_state["best_df_name"]
-    dp = float(st.session_state["dp"])
-    pp = float(st.session_state["pp"])
-    hp = float(st.session_state["hp"])
-    R0 = float(st.session_state["R0"])
+    best_df_name = st.session_state.get("best_df_name", "")
+    dp = float(st.session_state.get("dp", np.nan))
+    pp = float(st.session_state.get("pp", np.nan))
+    hp = float(st.session_state.get("hp", np.nan))
+    R0 = float(st.session_state.get("R0", np.nan))
     K_PROB = float(st.session_state.get("K_PROB", 6.0))
     REG_R0 = float(st.session_state.get("REG_R0", 0.05))
     min_n_iso = int(st.session_state.get("CALIB_MIN_N_ISO", 60))
@@ -1346,7 +1397,7 @@ with tab4:
         st.error("No ML models available (did Tab 3 run successfully?).")
         st.stop()
 
-    c1, c2, c3, c4 = st.columns([1.0, 1.15, 1.45, 1.1])
+    c1, c2, c3, c4 = st.columns([1.0, 1.05, 1.35, 1.0])
     with c1:
         thr_numopt_cv = st.number_input("NumOpt thr (CV)", min_value=0.01, max_value=0.99, value=0.50, step=0.01)
         thr_ml = st.number_input("ML thr (CV)", min_value=0.01, max_value=0.99, value=0.50, step=0.01)
@@ -1355,18 +1406,15 @@ with tab4:
             "NumOpt in CV",
             ["Fast (global params only)", "Paper (refit per fold)"],
             index=0,
-            help="Paper mode re-optimizes Numerical Optimization per fold (VERY slow)."
+            help="Paper mode re-optimizes Numerical Optimization per fold (very slow)."
         )
-        calibrate_in_cv = st.checkbox(
-            "Calibrate ML in CV (slow)",
-            value=False,
-            help="Default OFF for speed. Leave OFF for LOGO/LOO large datasets."
-        )
+        if cv_mode == "Paper (refit per fold)":
+            st.warning("Paper mode is slow: it refits Numerical Optimization per fold.")
     with c3:
         max_folds = st.number_input(
-            "Max folds (debug / safety)",
-            min_value=5, max_value=10000, value=200, step=50,
-            help="LOO has N folds. Keep this small in Streamlit Cloud; increase locally if needed."
+            "Max folds (debug)",
+            min_value=5, max_value=5000, value=200, step=25,
+            help="Limits folds for quick tests. Increase for full CV."
         )
         cv_models = st.multiselect(
             "Models to run in CV",
@@ -1377,13 +1425,8 @@ with tab4:
         topN_cv = st.number_input("Top-N ML lines in CV plots", min_value=1, max_value=5, value=2, step=1)
         show_plots_cv = st.checkbox("Show CV ROC/PR/Calib plots", value=True)
     with c4:
-        cv_profile = st.radio(
-            "CV model profile",
-            ["cv (fast)", "full (slow)"],
-            index=0,
-            help="Use 'cv (fast)' to avoid XGBoost taking forever."
-        )
-        cv_cal_cv = st.selectbox("Calibration CV (if enabled)", [2, 3], index=0)
+        cv_nms = st.number_input("CV: NM restarts", min_value=0, max_value=2, value=0, step=1)
+        cv_cobyla = st.number_input("CV: COBYLA restarts", min_value=0, max_value=2, value=0, step=1)
 
     if len(cv_models) == 0:
         st.warning("Select at least one model for CV.")
@@ -1394,55 +1437,45 @@ with tab4:
     if run_cv_btn:
         st.session_state["cv_last_error"] = ""
         try:
-            # Splitter (generator)
+            # Splitter
             if use_group:
                 splitter = LeaveOneGroupOut()
-                split_iter = splitter.split(X, y, groups=groups)
+                splits = list(splitter.split(X, y, groups=groups))
                 cv_label = "LOGO"
             else:
                 splitter = LeaveOneOut()
-                split_iter = splitter.split(X, y)
+                splits = list(splitter.split(X, y))
                 cv_label = "LOO"
+
+            if len(splits) == 0:
+                raise RuntimeError("No CV splits generated (check groups/labels).")
+
+            # limit folds for debug
+            splits = splits[: int(max_folds)]
 
             p_numopt_cv = np.zeros(len(y), dtype=float)
             p_ml_cv = {name: np.zeros(len(y), dtype=float) for name in cv_models}
 
-            # progress
-            pbar = st.progress(0)
-            status = st.empty()
-
-            fold = 0
-            used = 0
-            with st.spinner(f"Running {cv_label} CV... (up to {int(max_folds)} folds)"):
-                for (tr_idx, te_idx) in split_iter:
-                    fold += 1
-                    if fold > int(max_folds):
-                        break
-                    used += 1
-
-                    if fold % 10 == 0:
-                        pbar.progress(min(1.0, fold / float(max_folds)))
-                        status.write(f"Fold {fold}/{int(max_folds)} ...")
-
+            with st.spinner(f"Running {cv_label} CV... folds={len(splits)}"):
+                for (tr_idx, te_idx) in splits:
                     df_tr = df_filtered.iloc[tr_idx].reset_index(drop=True)
                     df_te = df_filtered.iloc[te_idx].reset_index(drop=True)
 
                     w_tr = w_local[tr_idx]
-                    y_tr = df_tr["solubility"].values.astype(int)
+                    y_tr = np.asarray(df_tr["solubility"].values, int).reshape(-1)
 
                     # -------- NumOpt in CV --------
                     if cv_mode == "Fast (global params only)":
                         pars_cv = np.array([dp, pp, hp, R0], float)
                     else:
-                        # Paper mode: muito lento — mantém "fast" por segurança
                         runs_cv = fit_by_methods(
                             df_local=df_tr,
                             weights_local=w_tr,
                             df_name=best_df_name,
                             K_PROB=float(K_PROB),
                             REG_R0=float(REG_R0),
-                            nms_restarts=0,
-                            cobyla_restarts=0,
+                            nms_restarts=int(cv_nms),
+                            cobyla_restarts=int(cv_cobyla),
                             speed_profile="fast"
                         )
                         if runs_cv is None or runs_cv.empty:
@@ -1454,91 +1487,73 @@ with tab4:
                     RED_te = red_values(df_te, pars_cv)
                     p_numopt_cv[te_idx] = prob_from_red(RED_te, k=float(K_PROB))
 
-                    # -------- ML per fold --------
-                    X_tr = df_tr[["delta_d", "delta_p", "delta_h"]].values
-                    X_te = df_te[["delta_d", "delta_p", "delta_h"]].values
+                    # -------- ML calibrated per fold --------
+                    X_tr = df_tr[["delta_d","delta_p","delta_h"]].values
+                    X_te = df_te[["delta_d","delta_p","delta_h"]].values
 
                     # guard: single-class fold
                     if len(np.unique(y_tr)) < 2:
-                        prev = float(np.clip(np.average(y, weights=w_local), 1e-12, 1 - 1e-12))
+                        prev = float(np.clip(np.average(y, weights=w_local), 1e-12, 1-1e-12))
                         for name in cv_models:
                             p_ml_cv[name][te_idx] = prev
                         continue
 
-                    p0_fold = float(np.clip(np.average(y_tr, weights=w_tr), 1e-12, 1 - 1e-12))
-                    fold_models = make_base_models(
-                        42, base_score=p0_fold,
-                        profile=("cv" if cv_profile.startswith("cv") else "full")
-                    )
+                    p0_fold = float(np.clip(np.average(y_tr, weights=w_tr), 1e-12, 1-1e-12))
+                    fold_models = make_base_models(42, base_score=p0_fold)
 
                     for name in cv_models:
                         est = fold_models.get(name, None)
                         if est is None:
                             p_ml_cv[name][te_idx] = p0_fold
                             continue
-
-                        # speed-first CV: default SEM calibração
-                        if not calibrate_in_cv:
-                            try:
-                                est.fit(X_tr, y_tr, sample_weight=w_tr)
-                            except TypeError:
-                                est.fit(X_tr, y_tr)
-                            p_ml_cv[name][te_idx] = est.predict_proba(X_te)[:, 1] if hasattr(est, "predict_proba") else p0_fold
+                        fitted = calibrate_model(est, X_tr, y_tr, w_tr, min_n_iso=int(min_n_iso))
+                        if hasattr(fitted, "predict_proba"):
+                            p_ml_cv[name][te_idx] = float(fitted.predict_proba(X_te)[:, 1])
                         else:
-                            fitted = calibrate_model(
-                                est, X_tr, y_tr, w_tr,
-                                min_n_iso=int(min_n_iso),
-                                cv_cal=int(cv_cal_cv),
-                                force_method="sigmoid"  # CV: rápido/estável
-                            )
-                            p_ml_cv[name][te_idx] = fitted.predict_proba(X_te)[:, 1] if hasattr(fitted, "predict_proba") else p0_fold
+                            p_ml_cv[name][te_idx] = p0_fold
 
-            pbar.progress(1.0)
-            status.write(f"Done. Folds used: {used}")
-
-            # cache after success
-            st.session_state["p_numopt_cv"] = p_numopt_cv
-            st.session_state["p_ml_cv"] = p_ml_cv
+            # cache only after success
+            st.session_state["p_numopt_cv"] = np.asarray(p_numopt_cv, float).reshape(-1)
+            st.session_state["p_ml_cv"] = {k: np.asarray(v, float).reshape(-1) for k, v in p_ml_cv.items()}
             st.session_state["cv_label"] = cv_label
             st.session_state["thr_numopt_cv"] = float(thr_numopt_cv)
             st.session_state["thr_ml"] = float(thr_ml)
             st.session_state["cv_mode_numopt"] = str(cv_mode)
             st.session_state["cv_models"] = list(cv_models)
             st.session_state["max_folds"] = int(max_folds)
-            st.session_state["cv_calibrate_ml"] = bool(calibrate_in_cv)
-            st.session_state["cv_profile"] = str(cv_profile)
 
-            st.success(f"{cv_label} CV done and cached. (folds used: {used})")
+            st.success(f"{cv_label} CV done and cached. (folds used: {len(splits)})")
 
             # metrics tables
             df_metrics_in_unw, df_metrics_in_w, df_metrics_cv_unw, df_metrics_cv_w = build_metrics_tables(
                 y=y, w=w_local,
-                p_in=st.session_state["p_numopt_in"], thr_in=float(st.session_state["thr_numopt_in"]),
-                p_cv=p_numopt_cv, thr_cv=float(thr_numopt_cv),
+                p_in=st.session_state.get("p_numopt_in", None), thr_in=float(st.session_state.get("thr_numopt_in", 0.5)),
+                p_cv=st.session_state["p_numopt_cv"], thr_cv=float(thr_numopt_cv),
                 ml_in_dict=st.session_state.get("proba_ml_in", {}),
-                ml_cv_dict=p_ml_cv,
+                ml_cv_dict=st.session_state["p_ml_cv"],
                 thr_ml=float(thr_ml),
                 cv_label=cv_label
             )
 
             st.session_state["df_metrics_in_unw"] = df_metrics_in_unw
-            st.session_state["df_metrics_in_w"] = df_metrics_in_w
+            st.session_state["df_metrics_in_w"]   = df_metrics_in_w
             st.session_state["df_metrics_cv_unw"] = df_metrics_cv_unw
-            st.session_state["df_metrics_cv_w"] = df_metrics_cv_w
+            st.session_state["df_metrics_cv_w"]   = df_metrics_cv_w
 
-            # best ML name (by CV unweighted ordering among ML models)
+            # best ML name (by CV unweighted ranking)
             ml_only = df_metrics_cv_unw[
-                df_metrics_cv_unw["Model"].str.contains(f"_{cv_label}") &
-                (~df_metrics_cv_unw["Model"].str.startswith("NumericalOptimization"))
+                df_metrics_cv_unw.get("Model", pd.Series([], dtype=str)).astype(str).str.contains(f"_{cv_label}") &
+                (~df_metrics_cv_unw.get("Model", pd.Series([], dtype=str)).astype(str).str.startswith("NumericalOptimization"))
             ]
             if not ml_only.empty:
                 best_ml_row = ml_only.iloc[0].to_dict()
-                best_ml_name = best_ml_row["Model"]
+                best_ml_name = str(best_ml_row.get("Model", ""))
                 best_ml_name = best_ml_name.replace(f"_{cv_label} (unweighted)", "")
                 best_ml_name = best_ml_name.replace(f"_{cv_label} (weighted)", "")
                 best_ml_name = best_ml_name.replace(f"_{cv_label}", "")
             else:
                 best_ml_name = cv_models[0] if len(cv_models) else model_names[0]
+
             st.session_state["best_ml_name"] = best_ml_name
 
         except Exception as e:
@@ -1554,7 +1569,7 @@ with tab4:
         st.stop()
 
     cv_label = st.session_state["cv_label"]
-    p_numopt_cv = st.session_state["p_numopt_cv"]
+    p_numopt_cv = np.asarray(st.session_state["p_numopt_cv"], float).reshape(-1)
     p_ml_cv = st.session_state["p_ml_cv"]
     best_ml_name = st.session_state.get("best_ml_name", model_names[0])
 
@@ -1562,42 +1577,42 @@ with tab4:
     st.write(f"Best ML (by CV unweighted ranking): **{best_ml_name}**")
     st.write(f"NumOpt in CV mode: **{st.session_state.get('cv_mode_numopt','')}**")
     st.write(f"CV models: {st.session_state.get('cv_models', [])} | Max folds used: {st.session_state.get('max_folds', '')}")
-    st.write(f"ML calibrated in CV: {st.session_state.get('cv_calibrate_ml', False)} | CV profile: {st.session_state.get('cv_profile','')}")
 
-    # rank for CV plots by AUPRC
+    # ROBUST rank for CV plots by AUPRC (não quebra)
     ranked_cv = []
     if len(np.unique(y)) == 2:
         for name, p in p_ml_cv.items():
-            ranked_cv.append((name, float(average_precision_score(y, p))))
+            try:
+                p = np.asarray(p, float).reshape(-1)
+                if len(p) != len(y):
+                    st.warning(f"[CV Rank] Skip {name}: len(p)={len(p)} ≠ len(y)={len(y)}")
+                    continue
+                ranked_cv.append((name, float(average_precision_score(y, p))))
+            except Exception as e:
+                st.warning(f"[CV Rank] Skip {name}: {e}")
         ranked_cv = sorted(ranked_cv, key=lambda t: -t[1])
     else:
         ranked_cv = [(k, 0.0) for k in p_ml_cv.keys()]
-    keep_cv_plot = [n for n, _ in ranked_cv[: int(topN_cv)]]
+
+    keep_cv_plot = [n for n, _ in ranked_cv[: int(topN_cv)]] if ranked_cv else list(p_ml_cv.keys())[: int(topN_cv)]
 
     if show_plots_cv and len(np.unique(y)) == 2:
         curves = [{"label": f"Numerical Optimization ({cv_label})", "p": p_numopt_cv, "lw": 2.2}]
         for name in keep_cv_plot:
-            curves.append({"label": f"{name} ({cv_label})", "p": p_ml_cv[name], "lw": 1.5})
+            curves.append({"label": f"{name} ({cv_label}, cal)", "p": p_ml_cv[name], "lw": 1.5})
 
         fig = plot_roc_pretty(y, curves, title="ROC Curve", subtitle=f"Cross-validation ({cv_label})")
-        if fig:
-            st.pyplot(fig, clear_figure=True)
+        if fig: st.pyplot(fig, clear_figure=True)
 
         fig = plot_pr_pretty(y, curves, title="Precision–Recall Curve", subtitle=f"Cross-validation ({cv_label})")
-        if fig:
-            st.pyplot(fig, clear_figure=True)
+        if fig: st.pyplot(fig, clear_figure=True)
 
-        # calibration curve only makes sense when calibrated in CV
-        if st.session_state.get("cv_calibrate_ml", False):
-            calib_dict = {f"Numerical Optimization ({cv_label})": p_numopt_cv}
-            for name in keep_cv_plot:
-                calib_dict[f"{name} ({cv_label})"] = p_ml_cv[name]
-            fig = plot_calibration_pretty(y, calib_dict, title="Calibration (Reliability) Plot",
-                                          subtitle=f"Cross-validation ({cv_label})", n_bins=10)
-            if fig:
-                st.pyplot(fig, clear_figure=True)
-        else:
-            st.info("CV plots: calibration curve skipped because 'Calibrate ML in CV' is OFF (recommended for speed).")
+        calib_dict = {f"Numerical Optimization ({cv_label})": p_numopt_cv}
+        for name in keep_cv_plot:
+            calib_dict[f"{name} ({cv_label}, cal)"] = p_ml_cv[name]
+        fig = plot_calibration_pretty(y, calib_dict, title="Calibration (Reliability) Plot",
+                                      subtitle=f"Cross-validation ({cv_label})", n_bins=10)
+        if fig: st.pyplot(fig, clear_figure=True)
 
     # Metrics tables
     df_metrics_cv_unw = st.session_state.get("df_metrics_cv_unw", pd.DataFrame())
@@ -1617,7 +1632,6 @@ with tab4:
     st.markdown("### Metrics IN — weighted")
     st.dataframe(df_metrics_in_w, use_container_width=True)
 
-# ============================================================
 # ============================================================
 # APP.PY — PARTE 4/4 (TAB 5 + TAB 6) — COMPLETA (6 ABAS)
 #  Tab 5: 3D Plotly — NumOpt sphere (RED=1) + ML shell/volume/quantile sphere + overlay
