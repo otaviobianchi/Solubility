@@ -41,7 +41,7 @@ st.set_page_config(page_title="Solubility App", layout="wide")
 # =========================
 with st.sidebar:
     st.markdown("## ⚙️ Cache")
-    if st.button("🧹 Limpar cache (st.cache_data)", use_container_width=True):
+    if st.button("🧹 Limpar cache", use_container_width=True):
         st.cache_data.clear()
         for k in [
             "proba_ml_in", "p_numopt_cv", "p_ml_cv",
@@ -2196,4 +2196,5 @@ with tab6:
         )
 
 # FIM — PARTE 4/4
+
 
