@@ -1,23 +1,5 @@
 # ============================================================
 # APP.PY — PARTE 1/4 (COMPLETA)
-#  ✅ Agora com 6 ABAS:
-#   tab1 Data
-#   tab2 Numerical Optimization (+ 3D rápido do NumOpt)
-#   tab3 ML (in-sample)
-#   tab4 Cross-Validation (LOGO/LOO)
-#   tab5 3D (NumOpt + ML + overlay)
-#   tab6 Export
-#
-#  ✅ Parte 1/4 inclui:
-#   - imports + config + tabs
-#   - session_state defaults
-#   - carga de Excel + mapeamento de colunas (Tab 1)
-#   - core numérico (Hansen distance, RED->p)
-#   - objective functions + fit_by_methods()
-#
-#  ⚠️ Importante:
-#   - Mantém "Numerical Optimization" (não Hansen no título do app)
-#   - Corrige imports faltantes (roc_auc_score, average_precision_score)
 # ============================================================
 
 import warnings
@@ -52,8 +34,6 @@ with st.sidebar:
                 del st.session_state[k]
         st.success("Cache limpo.")
         st.rerun()
-
-
 # -----------------------------
 # Streamlit config + 6 TABS
 # -----------------------------
@@ -515,20 +495,10 @@ w = st.session_state.get("w")
 use_group = st.session_state.get("use_group", False)
 groups = st.session_state.get("groups", None)
 UNIT = st.session_state.get("UNIT", "MPa\u00b9\u2044\u00b2")
-# ============================================================
-# APP.PY — PARTE 2/4 (TAB 2 COMPLETA)
-#  Aba 2: Numerical Optimization
-#   ✅ roda NumOpt (comparando DFs e solvers)
-#   ✅ mostra cards (δd, δp, δh, R0 + DF/optimizer)
-#   ✅ métricas rápidas + confusion matrix (in-sample)
-#   ✅ 2D map (mais abaixo)
-#   ✅ 3D RÁPIDO DO NUMOPT AQUI (para não precisar ir até o fim)
-#
-#  Requisitos (Parte 1/4):
-#   - df_filtered, y_raw, w, use_group, groups
-#   - hansen_distance, red_values, prob_from_red, fit_by_methods
-# ============================================================
 
+# ============================================================
+# APP.PY — PARTE 2/4 
+# ============================================================
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -904,19 +874,7 @@ with tab2:
         )
         st.pyplot(fig_map, clear_figure=True)
 ## ============================================================
-# APP.PY — PARTE 3/4 (TAB 3 + TAB 4) — COMPLETA E CORRIGIDA ✅
-#  ✅ Barra de progresso + ETA (Tab 3 e Tab 4)
-#  ✅ Cache por MODELO (Tab 3) -> UI “viva”
-#  ✅ Corrige erro do CV (XGBoost/Calibrated): não usa float(array)
-#  ✅ Corrige crash do average_precision_score (checagem de shape)
-#  ✅ Gera e salva tabelas de métricas (IN e CV; weighted/unweighted)
-#     -> df_metrics_in_unw, df_metrics_in_w, df_metrics_cv_unw, df_metrics_cv_w
-#  ✅ Define best_ml_name (in-sample e CV) automaticamente
-#
-#  Requisitos (Partes 1/4 e 2/4):
-#   - df_filtered, y_raw, w, use_group, groups
-#   - st.session_state["numopt_done"], dp, pp, hp, R0, p_numopt_in
-#   - funç: red_values, prob_from_red
+# APP.PY — PARTE 3/4 
 # ============================================================
 
 import io
@@ -1017,8 +975,6 @@ def plot_calibration_pretty(y_true, probas_dict, title="Calibration (Reliability
     _article_axes(ax)
     fig.tight_layout()
     return fig
-
-
 # ------------------------------------------------------------
 # Safe metrics helpers (evita crashes)
 # ------------------------------------------------------------
@@ -1080,8 +1036,6 @@ def _clf_metrics_at_thr(y, p, thr=0.5, w=None):
 
     # se quiser “weighted”, dá pra calcular depois via logloss/brier com sample_weight
     return dict(ACC=float(acc), Precision=float(prec), Recall=float(rec), F1=float(f1), MCC=float(mcc))
-
-
 # ------------------------------------------------------------
 # ML builders + calibration
 # ------------------------------------------------------------
@@ -1121,8 +1075,6 @@ def calibrate_model(base_estimator, X_tr, y_tr, w_tr, min_n_iso=60):
         except Exception:
             base_estimator.fit(X_tr, y_tr)
         return base_estimator
-
-
 # ------------------------------------------------------------
 # CACHE POR MODELO (Tab 3)
 # ------------------------------------------------------------
@@ -1141,7 +1093,6 @@ def fit_predict_one_model_cached(model_name: str, X_csv: str, y_tuple: tuple, w_
         p = fitted.predict_proba(X)[:, 1]
         return np.asarray(p, float).ravel()
     return None
-
 
 # ============================================================
 # TAB 3 — ML (Calibrated) IN-SAMPLE ✅ barra + ETA
@@ -1356,12 +1307,8 @@ with tab3:
         fig = plot_calibration_pretty(y, calib_dict, title="Calibration (Reliability) Plot", subtitle="In-sample", n_bins=10)
         if fig: st.pyplot(fig, clear_figure=True)
 
-
 # ============================================================
 # TAB 4 — CV (LOGO/LOO) — Out-of-fold probabilities ✅
-#  ✅ Corrige float(array) -> atribuição vetorial
-#  ✅ Barra + ETA
-#  ✅ Salva métricas CV (unweighted/weighted) e best_ml_name por AUPRC(CV)
 # ============================================================
 with tab4:
     st.subheader("Cross-Validation (LOGO/LOO) — Out-of-fold probabilities")
@@ -1656,25 +1603,7 @@ with tab4:
         if fig: st.pyplot(fig, clear_figure=True)
 
 # ============================================================
-# APP.PY — PARTE 4/4 (TAB 5 + TAB 6) — COMPLETA (6 ABAS)
-#  Tab 5: 3D Plotly — NumOpt sphere (RED=1) + ML shell/volume/quantile sphere + overlay
-#  Tab 6: Export Excel — base + resultados por amostra + métricas + configs + metadados
-#
-#  ✅ CORREÇÃO-CHAVE (seu erro):
-#   - A extração ML agora é ROBUSTA: se não existir p>=iso no grid (shell pts=0),
-#     cai automaticamente em "quantile fallback" (top-q) e SEMPRE extrai uma esfera.
-#   - Inclui "mode" na tabela ML_ShellSpheres: shell | volume | quantile(q=..)
-#
-#  ✅ Mantém:
-#   - 6 abas
-#   - Tons distintos (NumOpt azul, ML roxo)
-#   - Export completo (inclui ML_ShellSpheres se existir)
-#
-#  REQUISITOS (Partes 1/4–3/4):
-#   - df_filtered, y_raw, w, use_group, groups
-#   - st.session_state["numopt_done"], dp, pp, hp, R0, best_df_name, best_optimizer
-#   - funç: red_values, prob_from_red (NumOpt)
-#   - funç: make_base_models, calibrate_model (da Parte 3/4)
+# APP.PY — PARTE 4/4 
 # ============================================================
 
 import numpy as np
@@ -2288,4 +2217,5 @@ with tab6:
             use_container_width=True
         )
 
-# FIM — PARTE 4/4
+# FIM
+
